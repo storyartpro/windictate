@@ -1,7 +1,8 @@
-"""Реальные скриншоты фирменного UI WinDictate (STORYARTPRO).
+"""Реальные скриншоты UI WinDictate 0.2 по канону дизайн-системы.
 
-Снимает четыре PNG в ``win-dictate/screenshots/``:
-dictation-scene.png, dictation-paper.png, settings-scene.png, settings-paper.png.
+Снимает PNG в ``win-dictate/screenshots/``:
+dictation-normal-paper/scene, dictation-compact-scene, settings-paper/scene,
+settings-llm-paper (секции 07–08) и history-paper (окно истории).
 
 Окно находится через Win32 ``FindWindowW`` (и проверяется, что оно наше —
 по PID процесса), прямоугольник — ``GetWindowRect``, снимок — ``PIL.ImageGrab``.
@@ -25,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 SHOTS = ROOT / "screenshots"
 DICTATION_TITLE = "Диктовка"
-SETTINGS_TITLE = "Настройки — WinDictate"
+SETTINGS_TITLE = "Настройки — Диктовка"
 
 
 def enable_dpi_awareness() -> None:
@@ -161,7 +162,14 @@ def capture_dictation(
         pump(root, 0.2)
 
 
-def capture_settings(root, user32, theme_name: str) -> dict:
+def capture_settings(
+    root,
+    user32,
+    theme_name: str,
+    *,
+    scroll_bottom: bool = False,
+    llm: bool = False,
+) -> dict:
     from dictate import config
     from dictate.ui import SETTINGS_TITLE as TITLE, SettingsWindow
 
@@ -173,14 +181,23 @@ def capture_settings(root, user32, theme_name: str) -> dict:
         on_save=lambda _data: None,
         on_test_mic=lambda _data: None,
         on_model_status=lambda: ("Загружено: small · cuda · float16 · порт 3211", False),
+        on_history=lambda: None,
+        on_check_key=lambda _key, _model: (True, "Ключ работает."),
     )
     window.show()
-    pump(root, 1.2)
+    pump(root, 0.8)
+    if scroll_bottom:
+        try:
+            window.canvas.yview_moveto(1.0)
+        except Exception:  # noqa: BLE001
+            pass
+        pump(root, 0.6)
     try:
         hwnd = find_own_window(user32, TITLE)
         if not hwnd:
             return {"ok": False, "error": "окно «Настройки — Диктовка» не найдено"}
-        path = SHOTS / f"settings-{theme_name}.png"
+        suffix = "llm" if llm else theme_name
+        path = SHOTS / f"settings-{suffix}-{theme_name}.png" if llm else SHOTS / f"settings-{theme_name}.png"
         bbox = grab_window(user32, hwnd, path)
         return {"ok": True, "path": str(path), "bbox": bbox}
     finally:
@@ -189,8 +206,110 @@ def capture_settings(root, user32, theme_name: str) -> dict:
         pump(root, 0.2)
 
 
+class _DemoHistoryStore:
+    """Маленькое in-memory хранилище для скриншота окна истории."""
+
+    def __init__(self) -> None:
+        self._sessions = [
+            {
+                "id": "demo00000001",
+                "created_at": "2026-11-07T20:14:00",
+                "ts": 1.0,
+                "duration_ms": 12_400,
+                "chars": 58,
+                "text": "Привет, это локальная диктовка. Текст можно поправить и скопировать.",
+                "model": "small",
+                "source": "dictation",
+                "edited": False,
+            },
+            {
+                "id": "demo00000002",
+                "created_at": "2026-11-07T19:02:00",
+                "ts": 2.0,
+                "duration_ms": 7_800,
+                "chars": 42,
+                "text": "Короткая заметка для проверки истории диктовок.",
+                "model": "small",
+                "source": "dictation",
+                "edited": True,
+            },
+            {
+                "id": "demo00000003",
+                "created_at": "2026-11-06T11:45:00",
+                "ts": 3.0,
+                "duration_ms": 3_200,
+                "chars": 28,
+                "text": "Идея: добавить пресеты для улучшения текста.",
+                "model": "small",
+                "source": "dictation",
+                "edited": False,
+            },
+        ]
+
+    def list(self, query: str = "") -> list[dict]:
+        query = (query or "").lower()
+        return [dict(item) for item in self._sessions if query in item["text"].lower()]
+
+    def update_text(self, session_id: str, text: str) -> bool:
+        for item in self._sessions:
+            if item["id"] == session_id:
+                item["text"] = text
+                item["edited"] = True
+                item["chars"] = len(text)
+                return True
+        return False
+
+    def delete(self, session_id: str) -> bool:
+        before = len(self._sessions)
+        self._sessions = [item for item in self._sessions if item["id"] != session_id]
+        return len(self._sessions) != before
+
+    def clear(self) -> int:
+        count = len(self._sessions)
+        self._sessions = []
+        return count
+
+
+def capture_history(root, user32, theme_name: str) -> dict:
+    from dictate import config
+    from dictate.ui import HistoryWindow
+
+    settings = dict(config.DEFAULTS)
+    settings["theme"] = theme_name
+    palette = __import__("dictate.theme", fromlist=["theme"]).colors(theme_name)
+    window = HistoryWindow(
+        root,
+        _DemoHistoryStore(),
+        palette=palette,
+        ui_scale=float(settings.get("uiScale", 1.0)),
+    )
+    window.show()
+    try:
+        window.attributes("-topmost", True)
+        window.lift()
+        window.focus_force()
+    except Exception:  # noqa: BLE001
+        pass
+    pump(root, 1.0)
+    try:
+        hwnd = find_own_window(user32, window.TITLE)
+        if not hwnd:
+            return {"ok": False, "error": "окно «История — Диктовка» не найдено"}
+        path = SHOTS / f"history-{theme_name}.png"
+        bbox = grab_window(user32, hwnd, path)
+        return {"ok": True, "path": str(path), "bbox": bbox}
+    finally:
+        try:
+            window.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        pump(root, 0.2)
+
+
 def main() -> int:
     enable_dpi_awareness()
+    # Нейтральные пути для публичных скриншотов: без домашних dev-каталогов.
+    os.environ["WIN_DICTATE_DATA"] = r"C:\Apps\WinDictate\data"
     try:
         from dictate import theme
 
@@ -235,6 +354,15 @@ def main() -> int:
             results.append(
                 (f"settings-{theme_name}", capture_settings(root, user32, theme_name))
             )
+        results.append(
+            (
+                "settings-llm-paper",
+                capture_settings(root, user32, "paper", scroll_bottom=True, llm=True),
+            )
+        )
+        results.append(
+            ("history-paper", capture_history(root, user32, "paper"))
+        )
     finally:
         try:
             root.destroy()

@@ -10,6 +10,7 @@ Run:  <venv-python> tests\\test_core.py   (prints PASS n/n, exit code 0)
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -38,6 +39,14 @@ from dictate import engine as engine_mod  # noqa: E402
 from dictate.audio import PcmRecorder, encode_wav_pcm16, resample_linear, rms  # noqa: E402
 from dictate.engine import DictationEngine  # noqa: E402
 from dictate.stt import PORT_FIRST, PORT_LAST, SttService  # noqa: E402
+from dictate.history import SessionStore  # noqa: E402
+from dictate.postprocess import (  # noqa: E402
+    Edit,
+    PostprocessResult,
+    Suggestion,
+    apply_suggestions,
+    improve,
+)
 
 TESTS: list = []
 
@@ -961,6 +970,303 @@ def test_stt_reload_failure_sets_last_error_and_never_raises() -> None:
         service._get_health_locked = lambda timeout_s: good_wait()
         assert service.reload() is True
         assert service.state == "ready" and service.last_error is None
+
+
+# --------------------------------------------------------------------------- history (0.2.0)
+
+
+def _make_store(tmp_dir: str, limit: int = 300) -> SessionStore:
+    return SessionStore(Path(tmp_dir) / "sessions.json", limit=limit)
+
+
+@test
+def test_session_store_crud() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _make_store(tmp)
+        assert store.count() == 0 and store.list() == []
+        first = store.add("первый текст", duration_ms=1200, model="small")
+        second = store.add("второй текст")
+        assert set(first) == {
+            "id",
+            "created_at",
+            "ts",
+            "duration_ms",
+            "chars",
+            "text",
+            "model",
+            "source",
+            "edited",
+        }
+        assert len(first["id"]) == 12 and all(char in "0123456789abcdef" for char in first["id"])
+        assert first["duration_ms"] == 1200 and first["chars"] == len("первый текст")
+        assert first["source"] == "dictation" and first["edited"] is False
+        assert isinstance(first["created_at"], str) and "T" in first["created_at"]
+        items = store.list()
+        assert [item["id"] for item in items] == [second["id"], first["id"]]
+        assert store.get(first["id"])["text"] == "первый текст"
+        assert store.get("нет-такой") is None
+
+        time.sleep(0.01)
+        assert store.update_text(first["id"], "исправленный текст") is True
+        updated = store.get(first["id"])
+        assert updated["text"] == "исправленный текст" and updated["edited"] is True
+        assert updated["chars"] == len("исправленный текст")
+        assert updated["created_at"] == first["created_at"]
+        assert updated["ts"] >= first["ts"]
+        assert store.update_text("нет-такой", "x") is False
+
+        assert store.delete(second["id"]) is True and store.count() == 1
+        assert store.delete(second["id"]) is False
+        assert store.clear() == 1 and store.count() == 0
+
+
+@test
+def test_session_store_limit_trims_oldest() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _make_store(tmp, limit=3)
+        for index in range(5):
+            store.add(f"текст {index}")
+            time.sleep(0.005)
+        items = store.list()
+        assert len(items) == 3
+        assert [item["text"] for item in items] == ["текст 4", "текст 3", "текст 2"]
+        fresh = _make_store(tmp, limit=3)
+        assert fresh.count() == 3
+        assert [item["text"] for item in fresh.list()] == ["текст 4", "текст 3", "текст 2"]
+
+
+@test
+def test_session_store_broken_file_and_atomic_write() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sessions.json"
+        path.write_text("{это не json", encoding="utf-8")
+        store = SessionStore(path)
+        assert store.list() == [] and store.count() == 0
+        record = store.add("после битого файла")
+        assert store.count() == 1
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(data, list) and data[0]["id"] == record["id"]
+        assert not path.with_name(path.name + ".tmp").exists()
+
+        broken = Path(tmp) / "other.json"
+        broken.write_text('{"a": 1}', encoding="utf-8")
+        assert SessionStore(broken).list() == []
+
+
+@test
+def test_session_store_migrates_legacy_history_json() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        legacy = Path(tmp) / "history.json"
+        legacy.write_text(
+            json.dumps(
+                [
+                    {"text": "старая запись 1", "ts": 1000.0},
+                    {"text": "старая запись 2", "ts": 2000.0},
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        path = Path(tmp) / "sessions.json"
+        assert not path.exists()
+        store = SessionStore(path)
+        items = store.list()
+        assert [item["text"] for item in items] == ["старая запись 2", "старая запись 1"]
+        assert all(item["source"] == "import" and item["duration_ms"] == 0 for item in items)
+        assert len({item["id"] for item in items}) == 2
+        assert path.exists() and legacy.exists(), "старый history.json не должен удаляться"
+        again = SessionStore(path)
+        assert again.count() == 2
+
+        # Если sessions.json уже есть, старый файл больше не импортируется.
+        with tempfile.TemporaryDirectory() as tmp2:
+            Path(tmp2, "sessions.json").write_text("[]", encoding="utf-8")
+            Path(tmp2, "history.json").write_text('[{"text": "x", "ts": 1.0}]', encoding="utf-8")
+            assert SessionStore(Path(tmp2) / "sessions.json").count() == 0
+
+
+@test
+def test_session_store_search_and_persistence() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _make_store(tmp)
+        store.add("Купить молоко и хлеб")
+        store.add("Позвонить маме")
+        store.add("Молоко закончилось")
+        assert len(store.list()) == 3
+        found = store.list("молоко")
+        assert len(found) == 2
+        assert all("молоко" in item["text"].lower() for item in found)
+        assert store.list("нет такого") == []
+        assert store.list("   ") == store.list()
+        reopened = _make_store(tmp)
+        assert reopened.count() == 3
+        assert {item["text"] for item in reopened.list()} == {
+            "Купить молоко и хлеб",
+            "Позвонить маме",
+            "Молоко закончилось",
+        }
+
+
+# --------------------------------------------------------------------------- postprocess (0.2.0)
+
+
+@test
+def test_postprocess_empty_and_whitespace() -> None:
+    for value in ("", "   ", "\n\t "):
+        result = improve(value)
+        assert result.text == "" and result.edits == [] and result.suggestions == []
+    result = improve("  привет   мир  ")
+    assert result.text == "Привет мир"
+    assert result.edits and all(isinstance(edit, Edit) for edit in result.edits)
+
+
+@test
+def test_postprocess_punctuation_and_ellipsis() -> None:
+    assert improve("привет , мир ...").text == "Привет, мир…"
+    result = improve("привет ,как дела...")
+    assert result.text == "Привет, как дела…"
+    assert any(edit.rule.startswith("spaces") for edit in result.edits)
+
+
+@test
+def test_postprocess_capitalization_and_terminal() -> None:
+    assert improve("привет мир").text == "Привет мир"  # 2 слова — точка не нужна
+    assert improve("привет мир как дела").text == "Привет мир как дела."
+    assert improve("он сказал привет.я пошёл домой").text == "Он сказал привет. Я пошёл домой."
+    assert improve("это я и мой друг").text == "Это я и мой друг."  # «я» в середине — строчная
+    assert improve("Привет! как дела? хорошо").text == "Привет! Как дела? Хорошо."
+    assert improve("привет!").text == "Привет!"
+
+
+@test
+def test_postprocess_dash_and_ranges() -> None:
+    assert improve("слово - слово").text == "Слово — слово"  # 2 слова — без точки
+    assert improve("слово - слово - слово").text == "Слово — слово — слово."
+    assert improve("по-моему это так").text == "По-моему, это так."  # дефис внутри слова цел
+    assert improve("10 - 20 штук").text == "10 - 20 штук."
+    assert improve("1,5").text == "1,5"  # одна «словесная» единица — точку не ставим
+
+
+@test
+def test_postprocess_commas_before_conjunctions() -> None:
+    assert improve("я думаю что это правильно").text == "Я думаю, что это правильно."
+    assert improve("я думаю, что это правильно").text == "Я думаю, что это правильно."
+    assert improve("он пришёл но забыл ключи").text == "Он пришёл, но забыл ключи."
+    assert improve("книга которую я читал интересная").text == "Книга, которую я читал интересная."
+    assert improve("потому что было поздно мы ушли").text == "Потому что было поздно мы ушли."
+
+
+@test
+def test_postprocess_introductory_commas() -> None:
+    assert improve("конечно это работает").text == "Конечно, это работает."
+    assert improve("например это работает").text == "Например, это работает."
+    assert improve("во-первых это интересно").text == "Во-первых, это интересно."
+    assert improve("конечно, это работает").text == "Конечно, это работает."
+    assert "возможно," not in improve("не возможно это сделать").text
+
+
+@test
+def test_postprocess_grammar_replacements() -> None:
+    assert improve("в течении двух дней").text == "В течение двух дней."
+    assert improve("не смотря на дождь мы пошли").text == "Несмотря на дождь мы пошли."
+    assert improve("это то-же самое").text == "Это то же самое."
+    assert improve("он так-же пришёл").text == "Он так же пришёл."
+    assert improve("и т.д. и т.е.").text == "И т. д. и т. е."
+    assert improve("ввиду того что дождь").text == "Ввиду того, что дождь."
+    assert improve("я Сейчас приду").text == "Я сейчас приду."
+
+
+@test
+def test_postprocess_idempotent() -> None:
+    samples = [
+        "привет   мир как дела",
+        "он сказал привет.я пошёл домой",
+        "я думаю что это правильно",
+        "конечно это работает",
+        "в течении двух дней",
+        "Привет! Как дела? Хорошо.",
+        "цена 1,5 и 10 - 20 штук",
+        "он сказал «привет»",
+    ]
+    for sample in samples:
+        first = improve(sample)
+        second = improve(first.text)
+        assert second.text == first.text, (sample, first.text, second.text)
+        assert second.edits == [], (sample, second.edits)
+
+
+@test
+def test_postprocess_numbers_quotes_long_text() -> None:
+    result = improve("цена 1,5 рубля, скидка 10 - 20 процентов")
+    assert "1,5" in result.text and "10 - 20" in result.text
+    assert result.text.endswith(".")
+    quoted = improve("он сказал «я думаю что это»")
+    assert "«я думаю что это»" in quoted.text, quoted.text  # внутри кавычек не правим
+    assert quoted.text.endswith(".")
+    long_text = " ".join(["слово"] * 80)
+    long_result = improve(long_text)
+    assert long_result.text.endswith(".") and not long_result.text.endswith("..")
+    assert len(long_result.text) > len(long_text) - 1
+
+
+@test
+def test_postprocess_suggestions_tsya_forms() -> None:
+    assert improve("он начал заниматься спортом").suggestions == []
+    assert improve("мне нравится когда ты улыбаешься").suggestions == []
+    suspicious = improve("этот спорт заниматься нравится")
+    words = {suggestion.word: suggestion for suggestion in suspicious.suggestions}
+    assert "заниматься" in words
+    assert "заниматся" in words["заниматься"].variants
+    assert "-ться" in words["заниматься"].reason
+    trigger = improve("что нравится тебе")
+    assert trigger.suggestions and trigger.suggestions[0].word == "нравится"
+    assert "нравиться" in trigger.suggestions[0].variants
+
+
+@test
+def test_postprocess_suggestions_typos_latin_and_short_words() -> None:
+    latin = improve("cлово с латиницей")
+    assert latin.suggestions and latin.suggestions[0].variants == ["Слово"]
+    assert latin.suggestions[0].reason == "латиница в слове"
+    typos = improve("корекция програма")
+    by_word = {suggestion.word.lower(): suggestion for suggestion in typos.suggestions}
+    assert "коррекция" in [variant.lower() for variant in by_word["корекция"].variants]
+    assert "программа" in [variant.lower() for variant in by_word["програма"].variants]
+    merged = improve("он немогу прийти")
+    assert any("не могу" in suggestion.variants for suggestion in merged.suggestions)
+    phrase = improve("не возможно это сделать")
+    assert any("невозможно" in suggestion.variants for suggestion in phrase.suggestions)
+    short = improve("ы пришёл")
+    assert short.suggestions and short.suggestions[0].reason.startswith("очень короткое")
+
+
+@test
+def test_apply_suggestions_helpers() -> None:
+    result = improve("cлово и корекция")
+    assert len(result.suggestions) >= 2
+    text = result.text
+    first = result.suggestions[0]
+    assert text[first.start:first.end] == first.word
+    chosen = first.variants[0]
+    applied = apply_suggestions(text, result.suggestions, {0: chosen})
+    assert chosen in applied and first.word not in applied
+    assert apply_suggestions(text, result.suggestions, {0: None}) == text
+    assert apply_suggestions(text, result.suggestions, {0: "не из списка"}) == text
+    assert apply_suggestions(text, result.suggestions, {}) == text
+    assert apply_suggestions("", result.suggestions, {0: chosen}) == ""
+
+
+@test
+def test_postprocess_edits_metadata_and_english_language() -> None:
+    result = improve("привет   мир")
+    assert isinstance(result, PostprocessResult)
+    assert result.text == "Привет мир"
+    for edit in result.edits:
+        assert isinstance(edit, Edit) and edit.rule and isinstance(edit.start, int)
+        assert edit.end >= edit.start and edit.original != edit.replacement
+    english = improve("hello world how are you", language="en")
+    assert english.text == "Hello world how are you."
+    assert english.suggestions == []
 
 
 # --------------------------------------------------------------------------- runner

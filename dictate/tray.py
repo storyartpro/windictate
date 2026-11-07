@@ -128,6 +128,7 @@ class TrayIcon:
                 f"Диктовка ({hotkey})", self._on_dictate, default=True
             ),
             pystray.MenuItem("Показать окно", self._on_show_window),
+            pystray.MenuItem("История диктовок", self._on_history),
             pystray.MenuItem("Настройки", self._on_settings),
             pystray.MenuItem(
                 "Запускать с Windows",
@@ -153,6 +154,9 @@ class TrayIcon:
 
     def _on_show_window(self, *_args: Any) -> None:
         self._call("show_window")
+
+    def _on_history(self, *_args: Any) -> None:
+        self._call("open_history")
 
     def _on_settings(self, *_args: Any) -> None:
         self._call("open_settings")

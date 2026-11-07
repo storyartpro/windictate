@@ -28,7 +28,7 @@ APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from dictate import autostart, config, theme, winapi  # noqa: E402
+from dictate import autostart, config, llm, theme, winapi  # noqa: E402
 from dictate.hotkeys import HotkeyManager  # noqa: E402
 from dictate.tray import TrayIcon  # noqa: E402
 from dictate.ui import DictationWindow, SettingsWindow  # noqa: E402
@@ -189,6 +189,12 @@ class DictateApp:
         self._position_job: str | None = None
         self._settings_size_job: str | None = None
         self._reload_thread: threading.Thread | None = None
+        self.store: Any = None
+        self.history_window: Any = None
+        self.postprocess: Any = None
+        self._suggestions: list[Any] = []
+        self._improve_thread: threading.Thread | None = None
+        self._improve_busy = False
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -213,6 +219,11 @@ class DictateApp:
                 "pin": self._on_pin_changed,
                 "size": self._on_size_changed,
                 "move": self._on_window_moved,
+                "punctuation": self._punctuation_clicked,
+                "improve": self._improve_clicked,
+                "history": self.open_history,
+                "contested": self._contested_clicked,
+                "suggestions": self._on_suggestions_applied,
             },
             self.settings,
         )
@@ -300,7 +311,8 @@ class DictateApp:
         LOG.info(
             "Настройки применены: theme=%s accent=%s model=%s language=%s device=%s "
             "sttDevice=%s vad=%s hotkey=%s (%s), settingsHotkey=%s (%s), sizeMode=%s "
-            "pinned=%s uiScale=%s, autostart=%s, pauseMs=%s, maxRecordMs=%s",
+            "pinned=%s uiScale=%s, autostart=%s, pauseMs=%s, maxRecordMs=%s, "
+            "autoPostprocess=%s sessionsLimit=%s llmModel=%s llmPreset=%s",
             settings.get("theme", theme.DEFAULT_THEME),
             settings.get("accent"),
             settings.get("model"),
@@ -318,6 +330,10 @@ class DictateApp:
             autostart_state,
             settings.get("pauseMs"),
             settings.get("maxRecordMs"),
+            settings.get("autoPostprocess"),
+            settings.get("sessionsLimit"),
+            settings.get("llmModel"),
+            settings.get("llmPreset"),
         )
 
     def _on_engine_event(self, event: dict[str, Any]) -> None:
@@ -492,26 +508,294 @@ class DictateApp:
         self.last_text = text
         self.window.set_state("idle")
         self.window.set_text(text)
+        self._suggestions = []
+        try:
+            self.window.set_contested(0)
+        except Exception:  # noqa: BLE001
+            pass
         if cancelled:
             if not self.window.pinned:
                 self.window.hide()
             self._focus_guard_until = 0.0
             return
         if text.strip():
+            final_text = text
+            edits_count = 0
+            suggestions: list[Any] = []
+            if self.settings.get("autoPostprocess", True):
+                processed = self._run_postprocess(text)
+                if processed is not None:
+                    final_text, edits_count, suggestions = processed
+                    if final_text != text:
+                        self._replace_text_undo(final_text)
+                    LOG.info(
+                        "Постобработка: %d правок, %d спорных",
+                        edits_count,
+                        len(suggestions),
+                    )
+            self.last_text = final_text
+            self._suggestions = (
+                list(suggestions) if self.settings.get("suggestContested", True) else []
+            )
+            try:
+                self.window.set_contested(len(self._suggestions))
+            except Exception:  # noqa: BLE001
+                pass
+            notices: list[str] = []
+            if edits_count:
+                notices.append(f"Пунктуация и грамматика: {edits_count} правок")
+            if self._suggestions:
+                notices.append(
+                    f"Спорных слов: {len(self._suggestions)} — проверить"
+                )
             if self.settings.get("autoCopy", True):
-                if winapi.set_clipboard_text(text):
-                    self.window.set_notice("Скопировано в буфер")
+                if winapi.set_clipboard_text(final_text):
+                    notices.append("Скопировано в буфер")
                 else:
-                    self.window.set_notice("Не удалось скопировать в буфер.")
-            else:
-                self.window.set_notice("Текст готов — можно править и копировать")
-            append_history(text, int(self.settings.get("historyLimit", 50) or 0))
+                    notices.append("Не удалось скопировать в буфер.")
+            if not notices:
+                notices.append("Текст готов — можно править и копировать")
+            self.window.set_notice(" · ".join(notices))
+            self._save_session(
+                final_text, int(event.get("duration_ms") or 0)
+            )
         else:
             self.window.set_notice("Ничего не распознано")
         if error:
             self.window.set_notice(str(error))
         if self.window.pinned:
             self.window.show(focus=False)
+        # Иначе фокус может остаться на скрытой кнопке «Остановить», и Enter
+        # (клавиша Tk-кнопок) сработает не как «скопировать и закрыть».
+        if not cancelled and self.window.visible:
+            try:
+                self.window.focus_editor()
+            except Exception:  # noqa: BLE001 - фокус не критичен
+                pass
+
+    # ------------------------------------------------------------------ postprocess / history
+
+    def _ensure_postprocess(self) -> Any:
+        if self.postprocess is not None:
+            return self.postprocess
+        try:
+            from dictate import postprocess as module
+
+            self.postprocess = module
+        except Exception as exc:  # noqa: BLE001 - модуль может быть ещё не собран
+            LOG.warning("Постобработка недоступна: %s", exc)
+            self.postprocess = False
+        return self.postprocess or None
+
+    def _run_postprocess(self, text: str) -> tuple[str, int, list[Any]] | None:
+        module = self._ensure_postprocess()
+        if module is None:
+            return None
+        try:
+            result = module.improve(text, language=str(self.settings.get("language", "ru")))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("Постобработка не удалась: %s", exc)
+            return None
+        new_text = str(getattr(result, "text", text) or text)
+        edits = list(getattr(result, "edits", []) or [])
+        suggestions = list(getattr(result, "suggestions", []) or [])
+        return new_text, len(edits), suggestions
+
+    def _replace_text_undo(self, text: str) -> None:
+        try:
+            self.window.set_text_undo(text)
+        except Exception:  # noqa: BLE001
+            self.window.set_text(text)
+
+    def _save_session(self, text: str, duration_ms: int) -> None:
+        try:
+            store = self._ensure_store()
+            if store is None:
+                return
+            store.add(
+                text,
+                duration_ms=max(0, int(duration_ms)),
+                model=str(self.settings.get("model") or ""),
+                source="dictation",
+            )
+        except Exception:  # noqa: BLE001 - история не должна ломать диктовку
+            LOG.exception("Не удалось сохранить сессию в историю")
+
+    def _ensure_store(self) -> Any:
+        if self.store is not None:
+            return self.store
+        try:
+            from dictate import history as history_module
+
+            self.store = history_module.SessionStore(
+                limit=max(20, min(1000, int(self.settings.get("sessionsLimit", 300))))
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("История недоступна: %s", exc)
+            self.store = False
+        return self.store or None
+
+    def _punctuation_clicked(self) -> None:
+        text = self.window.get_text()
+        if not text.strip():
+            self.window.set_notice("Нет текста для обработки")
+            return
+        processed = self._run_postprocess(text)
+        if processed is None:
+            self.window.set_notice("Постобработка недоступна", error=True)
+            return
+        new_text, edits_count, suggestions = processed
+        if new_text != text:
+            self._replace_text_undo(new_text)
+            self.last_text = new_text
+        self._suggestions = (
+            list(suggestions) if self.settings.get("suggestContested", True) else []
+        )
+        try:
+            self.window.set_contested(len(self._suggestions))
+        except Exception:  # noqa: BLE001
+            pass
+        notices = []
+        if edits_count:
+            notices.append(f"Пунктуация и грамматика: {edits_count} правок")
+        if self._suggestions:
+            notices.append(f"Спорных слов: {len(self._suggestions)} — проверить")
+        if not notices:
+            notices.append("Пунктуация: изменений нет")
+        self.window.set_notice(" · ".join(notices))
+        LOG.info("Постобработка: %d правок, %d спорных", edits_count, len(self._suggestions))
+
+    def _contested_clicked(self) -> None:
+        if not self._suggestions:
+            self.window.set_notice("Спорных слов нет")
+            return
+        try:
+            self.window.show_suggestions(self._suggestions)
+        except Exception:  # noqa: BLE001
+            LOG.exception("Не удалось показать спорные слова")
+
+    def _on_suggestions_applied(self, choices: dict[int, str | None]) -> None:
+        module = self._ensure_postprocess()
+        if module is None or not self._suggestions:
+            return
+        try:
+            new_text = module.apply_suggestions(
+                self.window.get_text(), self._suggestions, choices
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.window.set_notice(f"Не удалось применить варианты: {exc}", error=True)
+            return
+        changed = sum(1 for value in choices.values() if value is not None)
+        self._replace_text_undo(str(new_text))
+        self.last_text = str(new_text)
+        self._suggestions = []
+        try:
+            self.window.set_contested(0)
+        except Exception:  # noqa: BLE001
+            pass
+        self.window.set_notice(f"Спорные слова: применено {changed}")
+        LOG.info("Спорные слова: применено %d", changed)
+
+    def _improve_clicked(self) -> None:
+        key = str(self.settings.get("llmApiKey") or "").strip()
+        if not key:
+            self.window.set_notice(
+                "Укажите API-ключ DeepSeek в настройках", error=True
+            )
+            self.open_settings()
+            return
+        if self._improve_busy:
+            return
+        text = self.window.get_text().strip()
+        if not text:
+            self.window.set_notice("Нет текста для улучшения")
+            return
+        snapshot = dict(self.settings)
+        self._improve_busy = True
+        try:
+            self.window.set_improve_busy(True)
+        except Exception:  # noqa: BLE001
+            pass
+        self.window.set_notice("Улучшаю текст…")
+
+        def worker() -> None:
+            started = time.monotonic()
+            try:
+                result = llm.improve_text(
+                    text,
+                    api_key=key,
+                    model=str(snapshot.get("llmModel") or llm.DEFAULT_MODEL),
+                    preset=str(snapshot.get("llmPreset") or "standard"),
+                    strength=int(snapshot.get("llmStrength") or 3),
+                    quality=int(snapshot.get("llmQuality") or 3),
+                )
+            except Exception as exc:  # noqa: BLE001
+                elapsed = time.monotonic() - started
+                message = str(exc)
+                LOG.warning("LLM: ошибка за %.1f с: %s", elapsed, message)
+                self._ui_call(lambda: self._finish_improve(None, message))
+                return
+            elapsed = time.monotonic() - started
+            LOG.info("LLM: улучшение за %.1f с", elapsed)
+            self._ui_call(lambda: self._finish_improve(str(result), None))
+
+        self._improve_thread = threading.Thread(
+            target=worker, name="WinDictateLlm", daemon=True
+        )
+        self._improve_thread.start()
+
+    def _finish_improve(self, text: str | None, error: str | None) -> None:
+        self._improve_busy = False
+        try:
+            self.window.set_improve_busy(False)
+        except Exception:  # noqa: BLE001
+            pass
+        if error is not None:
+            self.window.set_notice(error, error=True)
+            return
+        if not text or not str(text).strip():
+            self.window.set_notice("DeepSeek вернул пустой ответ", error=True)
+            return
+        self._replace_text_undo(str(text))
+        self.last_text = str(text)
+        self.window.set_notice("Улучшено (DeepSeek)")
+
+    # ------------------------------------------------------------------ history window
+
+    def open_history(self) -> None:
+        self._ui_call(self._open_history_ui)
+
+    def _open_history_ui(self) -> None:
+        if self._closed:
+            return
+        store = self._ensure_store()
+        if store is None:
+            self.window.set_notice("История недоступна", error=True)
+            return
+        if self.history_window is not None:
+            try:
+                self.history_window.show()
+                self.history_window.refresh()
+                return
+            except Exception:  # noqa: BLE001
+                self.history_window = None
+        try:
+            from dictate.ui import HistoryWindow
+
+            self.history_window = HistoryWindow(
+                self.root,
+                store,
+                palette=self.window.palette,
+                on_close=self._on_history_closed,
+                ui_scale=self.window.ui_scale,
+            )
+            self.history_window.show()
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("Не удалось открыть историю")
+            self.window.set_notice(f"История недоступна: {exc}", error=True)
+
+    def _on_history_closed(self) -> None:
+        self.history_window = None
 
     # ------------------------------------------------------------------ dictation
 
@@ -769,6 +1053,8 @@ class DictateApp:
             on_model_status=self._model_status_text,
             on_settings_size=self._on_settings_size,
             on_open_logs=self._open_logs,
+            on_history=self.open_history,
+            on_check_key=self._check_llm_key,
         )
         self.settings_window.show()
 
@@ -797,6 +1083,13 @@ class DictateApp:
         if state == "error" or last_error:
             return (str(last_error or "Ошибка загрузки модели"), True)
         return ("Модель ещё не загружена — начните диктовку или перезагрузите", False)
+
+    def _check_llm_key(self, api_key: str, model: str) -> tuple[bool, str]:
+        """Проверка ключа DeepSeek по кнопке в настройках (вызывается из фона)."""
+        try:
+            return llm.check_key(api_key, model=model or llm.DEFAULT_MODEL)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Не удалось проверить ключ: {exc}"
 
     def _reload_model_async(self, settings: dict[str, Any]) -> None:
         """Кнопка «Перезагрузить модель»: reload в фоне, UI не блокируется."""

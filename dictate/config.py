@@ -42,6 +42,14 @@ DEFAULTS: dict[str, Any] = {
     "settingsH": None,
     "sttDevice": "auto",  # auto | cuda | cpu
     "vad": True,  # Silero VAD
+    "autoPostprocess": True,  # пунктуация/грамматика после диктовки
+    "suggestContested": True,  # показывать разбор «спорных» слов
+    "sessionsLimit": 300,  # сколько сессий хранить (20..1000)
+    "llmApiKey": "",  # ключ DeepSeek API (хранится в settings.json)
+    "llmModel": "deepseek-chat",  # deepseek-chat | deepseek-reasoner
+    "llmPreset": "standard",  # light | standard | strong
+    "llmStrength": 3,  # 1..5 — насколько смело можно менять текст
+    "llmQuality": 3,  # 1..5 — качество/глубина проверки
 }
 
 LANGUAGES = ("ru", "en", "auto")
@@ -49,6 +57,8 @@ MODELS = ("tiny", "base", "small", "medium", "large-v3-turbo")
 THEMES = ("scene", "paper")
 SIZE_MODES = ("compact", "normal", "wide")
 STT_DEVICES = ("auto", "cuda", "cpu")
+LLM_MODELS = ("deepseek-chat", "deepseek-reasoner")
+LLM_PRESETS = ("light", "standard", "strong")
 DEFAULT_ACCENT = "#C0603C"
 
 _KEYS = tuple(DEFAULTS.keys())
@@ -206,6 +216,30 @@ def normalize_settings(raw: Any) -> dict[str, Any]:
         stt_device if stt_device in STT_DEVICES else DEFAULTS["sttDevice"]
     )
     settings["vad"] = _as_bool(source.get("vad"), DEFAULTS["vad"])
+
+    settings["autoPostprocess"] = _as_bool(
+        source.get("autoPostprocess"), DEFAULTS["autoPostprocess"]
+    )
+    settings["suggestContested"] = _as_bool(
+        source.get("suggestContested"), DEFAULTS["suggestContested"]
+    )
+    settings["sessionsLimit"] = _clamp_int(
+        source.get("sessionsLimit"), DEFAULTS["sessionsLimit"], 20, 1000
+    )
+    api_key = source.get("llmApiKey")
+    settings["llmApiKey"] = api_key.strip() if isinstance(api_key, str) else ""
+    llm_model = source.get("llmModel")
+    settings["llmModel"] = (
+        llm_model if llm_model in LLM_MODELS else DEFAULTS["llmModel"]
+    )
+    preset = source.get("llmPreset")
+    settings["llmPreset"] = preset if preset in LLM_PRESETS else DEFAULTS["llmPreset"]
+    settings["llmStrength"] = _clamp_int(
+        source.get("llmStrength"), DEFAULTS["llmStrength"], 1, 5
+    )
+    settings["llmQuality"] = _clamp_int(
+        source.get("llmQuality"), DEFAULTS["llmQuality"], 1, 5
+    )
 
     # Только известные ключи: мусор из старого/чужого файла отбрасываем.
     return {key: settings[key] for key in _KEYS}

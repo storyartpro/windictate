@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import os
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
 import types
+import queue
 from pathlib import Path
 from unittest import mock
 
@@ -34,7 +36,9 @@ from dictate.ui import (  # noqa: E402
     WINDOW_TITLE,
     BrandSlider,
     DictationWindow,
+    HistoryWindow,
     SettingsWindow,
+    SuggestionsWindow,
     format_elapsed,
     icons_available,
     spec_from_tk_event,
@@ -710,7 +714,7 @@ def test_theme_tokens_and_fonts() -> None:
     assert theme.RADIUS["button"] == 0
     assert theme.RADIUS["field"] == 2
     assert theme.APP_TITLE == "Диктовка"
-    assert theme.APP_VERSION == "0.1.0"
+    assert theme.APP_VERSION == "0.2.0"
     # Микролейблы канона — ALL CAPS в квадратных скобках.
     micro = theme.micro("Распознавание")
     assert micro.startswith("[") and micro.endswith("]")
@@ -1159,6 +1163,7 @@ def test_brand_slider_colors_and_input() -> None:
         second.pack(fill="x", padx=20)
         try:
             top.update()
+            second._on_leave()
             assert second.track_color == paper["border"]
             assert second.thumb_color == paper["accent"]
             assert second.get() == 600
@@ -1207,6 +1212,107 @@ def test_ui_show_focuses_text() -> None:
         window.win.destroy()
 
 
+class _FakeSessionStore:
+    """In-memory SessionStore для UI-тестов истории."""
+
+    def __init__(self, sessions: list[dict] | None = None, limit: int = 300) -> None:
+        self.sessions = [dict(item) for item in (sessions or [])]
+        self.limit = limit
+        self.added: list[dict] = []
+        self.counter = 0
+
+    def add(self, text: str, *, duration_ms: int = 0, model: str = "", source: str = "dictation") -> dict:
+        self.counter += 1
+        session = {
+            "id": f"id{self.counter:010d}",
+            "created_at": "2026-11-07T20:14:00",
+            "ts": float(self.counter),
+            "duration_ms": int(duration_ms),
+            "chars": len(text),
+            "text": text,
+            "model": model,
+            "source": source,
+            "edited": False,
+        }
+        self.sessions.insert(0, session)
+        self.sessions = self.sessions[: self.limit]
+        self.added.append(session)
+        return session
+
+    def list(self, query: str = "") -> list[dict]:
+        query = (query or "").strip().lower()
+        items = [dict(item) for item in self.sessions]
+        if query:
+            items = [item for item in items if query in str(item.get("text", "")).lower()]
+        return items
+
+    def get(self, session_id: str) -> dict | None:
+        return next((dict(item) for item in self.sessions if item.get("id") == session_id), None)
+
+    def update_text(self, session_id: str, text: str) -> bool:
+        for item in self.sessions:
+            if item.get("id") == session_id:
+                item["text"] = text
+                item["edited"] = True
+                item["chars"] = len(text)
+                return True
+        return False
+
+    def delete(self, session_id: str) -> bool:
+        before = len(self.sessions)
+        self.sessions = [item for item in self.sessions if item.get("id") != session_id]
+        return len(self.sessions) != before
+
+    def clear(self) -> int:
+        count = len(self.sessions)
+        self.sessions = []
+        return count
+
+    def count(self) -> int:
+        return len(self.sessions)
+
+
+class _FakeHistoryStore(_FakeSessionStore):
+    pass
+
+
+class _FakePostprocess:
+    """Фейковая постобработка: подчёркивает текст и даёт одно suggestion."""
+
+    class _Result:
+        def __init__(self, text: str, suggestions: list) -> None:
+            self.text = text
+            self.edits = [object(), object()]
+            self.suggestions = suggestions
+
+    def __init__(self, suggestions: list | None = None) -> None:
+        self.suggestions = suggestions or []
+        self.calls: list[str] = []
+
+    def improve(self, text: str, language: str = "ru"):
+        self.calls.append(text)
+        return self._Result(text.rstrip() + "!", list(self.suggestions))
+
+    @staticmethod
+    def apply_suggestions(text: str, suggestions: list, choices: dict[int, str | None]) -> str:
+        result = text
+        for index, value in choices.items():
+            if value is None or index >= len(suggestions):
+                continue
+            suggestion = suggestions[index]
+            result = result.replace(str(suggestion.word), str(value), 1)
+        return result
+
+
+class _FakeSuggestion:
+    def __init__(self, word: str, variants: list[str], reason: str = "частая опечатка") -> None:
+        self.word = word
+        self.variants = variants
+        self.reason = reason
+        self.start = 0
+        self.end = len(word)
+
+
 class _SlowStopEngine:
     """Фейковый движок: stop() «финализирует» 300 мс, чтобы поймать фриз UI."""
 
@@ -1233,12 +1339,13 @@ def test_stop_dictation_async_and_escape() -> None:
 
     instance = make_isolated_app(app_module)
     previous_clipboard = winapi.get_clipboard_text()
-    original_history_path = app_module.config.history_path
+    store = _FakeSessionStore()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            history = Path(tmp) / "history.json"
-            app_module.config.history_path = lambda: history
+        if True:
             instance.settings["autoCopy"] = True
+            instance.settings["autoPostprocess"] = False
+            instance.postprocess = False
+            instance.store = store
             fake = _SlowStopEngine()
             instance.engine = fake
             fake.state = "recording"
@@ -1270,7 +1377,9 @@ def test_stop_dictation_async_and_escape() -> None:
             assert instance._stopping is False
             assert instance.window.get_text() == "тест асинхронного стопа"
             assert winapi.get_clipboard_text() == "тест асинхронного стопа"
-            assert app_module.load_history(), "история не записалась после done"
+            assert store.added, "сессия не сохранилась после done"
+            assert store.added[-1]["text"] == "тест асинхронного стопа"
+            assert store.added[-1]["duration_ms"] == 1200
             # Esc во время finalizing отменяет запись и закрывает окно.
             fake2 = _SlowStopEngine()
             instance.engine = fake2
@@ -1281,7 +1390,6 @@ def test_stop_dictation_async_and_escape() -> None:
             assert fake2.cancel_calls == 1, "Esc в finalizing не отменил запись"
             assert instance.window.visible is False
     finally:
-        app_module.config.history_path = original_history_path
         winapi.set_clipboard_text(previous_clipboard)
         instance._quit_ui()
 
@@ -1340,22 +1448,24 @@ def test_app_import_no_windows() -> None:
 
 
 def test_app_history_roundtrip() -> None:
+    """app сохраняет сессию через SessionStore (а не старый history.json)."""
     import app as app_module
 
-    with tempfile.TemporaryDirectory() as tmp:
-        history = Path(tmp) / "history.json"
-        original = app_module.config.history_path
-        app_module.config.history_path = lambda: history
-        try:
-            app_module.append_history("первая", 2)
-            app_module.append_history("вторая", 2)
-            app_module.append_history("третья", 2)
-            items = app_module.load_history()
-            assert [item["text"] for item in items] == ["третья", "вторая"]
-            app_module.append_history("игнор", 0)
-            assert len(app_module.load_history()) == 2
-        finally:
-            app_module.config.history_path = original
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    try:
+        store = _FakeSessionStore(limit=5)
+        instance.store = store
+        instance._save_session("первая сессия", 1200)
+        instance._save_session("вторая сессия", 3400)
+        items = store.list()
+        assert [item["text"] for item in items] == ["вторая сессия", "первая сессия"]
+        assert items[0]["duration_ms"] == 3400
+        assert items[0]["source"] == "dictation"
+        assert store.count() == 2
+    finally:
+        instance._quit_ui()
+        root.update()
 
 
 class _FakeHotkeys:
@@ -1749,6 +1859,13 @@ def test_compact_layout_fits_window() -> None:
         # «Новая» в compact — иконка + tooltip, текст не нужен.
         assert window.new_button._icon_only is True
         assert window.get_text().startswith("Компактный")
+        # Действия постобработки в compact — тоже иконки и тоже влезают.
+        window.set_contested(1)
+        root.update()
+        for button in window.compact_action_buttons:
+            assert button.winfo_ismapped()
+            right = button.winfo_rootx() - window.win.winfo_rootx() + button.winfo_width()
+            assert right <= window.width, ("compact action", right)
         # Шапка тоже в пределах окна.
         for name in ("pin_button", "size_button", "settings_button", "close_button"):
             button = getattr(window, name)
@@ -1802,6 +1919,451 @@ def test_settings_all_sections_reachable() -> None:
         assert window.cancel_button.winfo_ismapped()
     finally:
         window.destroy()
+
+
+def _drain_app_events(instance) -> None:
+    """Обрабатывает отложенные UI-события без запуска mainloop."""
+    for _ in range(200):
+        try:
+            event = instance.events.get_nowait()
+        except queue.Empty:
+            break
+        instance._handle_event(event)
+
+
+def test_about_paths_use_data_dir() -> None:
+    """В «О ПРОГРАММЕ» нет dev-путей: каталог/логи берутся из data_dir (env override)."""
+    import tkinter as tk
+
+    root = get_root()
+    with mock.patch.dict(
+        os.environ, {"WIN_DICTATE_DATA": r"C:\Apps\WinDictate\data"}
+    ):
+        window = SettingsWindow(root, dict(config.DEFAULTS))
+        try:
+            def walk(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from walk(child)
+
+            texts = [
+                str(child.cget("text"))
+                for child in walk(window.body)
+                if isinstance(child, tk.Label)
+            ]
+            joined = "\n".join(texts)
+            assert r"C:\Apps\WinDictate\data" in joined
+            assert "Users" not in joined and "deepseek-harness" not in joined
+        finally:
+            window.destroy()
+    root.update()
+
+
+def test_postprocess_buttons_visible() -> None:
+    root = get_root()
+    events: list[str] = []
+    window = DictationWindow(
+        root,
+        {
+            "punctuation": lambda: events.append("punctuation"),
+            "improve": lambda: events.append("improve"),
+            "history": lambda: events.append("history"),
+            "contested": lambda: events.append("contested"),
+        },
+        dict(config.DEFAULTS),
+    )
+    try:
+        window.set_state("idle")
+        window.show()
+        root.update()
+        assert window.actions_bar.winfo_manager() != ""
+        for button, name in (
+            (window.punctuation_button, "punctuation"),
+            (window.improve_button, "improve"),
+            (window.history_button, "history"),
+        ):
+            assert button.winfo_ismapped(), name
+            button.invoke()
+        assert events == ["punctuation", "improve", "history"]
+        assert window.contested_button.winfo_manager() == ""
+        window.set_contested(2)
+        root.update()
+        assert window.contested_button.winfo_manager() != ""
+        assert "2" in window.contested_button.cget("text")
+        window.contested_button.invoke()
+        assert events[-1] == "contested"
+        window.set_state("recording")
+        root.update()
+        assert window.actions_bar.winfo_manager() == ""
+        window.set_state("idle")
+        window.set_contested(0)
+        root.update()
+    finally:
+        window.win.destroy()
+
+    compact = DictationWindow(root, {}, {**dict(config.DEFAULTS), "sizeMode": "compact"})
+    try:
+        compact.set_state("idle")
+        compact.set_contested(1)
+        compact.show()
+        root.update()
+        assert compact.actions_bar.winfo_manager() == ""
+        for button in compact.compact_action_buttons:
+            assert button.winfo_ismapped(), "компактная иконка действия не видна"
+    finally:
+        compact.win.destroy()
+
+
+def test_suggestions_window_apply() -> None:
+    root = get_root()
+    choices_seen: list[dict] = []
+    suggestions = [
+        _FakeSuggestion("тест", ["тест2", "test"]),
+        _FakeSuggestion("слово", ["слово2"]),
+    ]
+    window = SuggestionsWindow(
+        root, suggestions, theme.colors("paper"), on_apply=choices_seen.append
+    )
+    try:
+        window._choose(0, "тест2")
+        window._choose(1, None)
+        assert window.choices == {0: "тест2", 1: None}
+        window.apply()
+        assert choices_seen == [{0: "тест2", 1: None}]
+    finally:
+        root.update()
+
+
+def test_auto_postprocess_on_done() -> None:
+    import app as app_module
+
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    previous_clipboard = winapi.get_clipboard_text()
+    fake_store = _FakeSessionStore()
+    suggestion = _FakeSuggestion("текст", ["тест"])
+    try:
+        instance.settings.update(
+            {
+                "autoPostprocess": True,
+                "suggestContested": True,
+                "autoCopy": False,
+                "model": "small",
+            }
+        )
+        instance.postprocess = _FakePostprocess([suggestion])
+        instance.store = fake_store
+        instance._handle_done(
+            {
+                "type": "done",
+                "text": "текст",
+                "cancelled": False,
+                "duration_ms": 2500,
+                "error": None,
+            }
+        )
+        root.update()
+        assert instance.window.get_text() == "текст!"
+        assert fake_store.added, "итоговый текст не сохранён в сессию"
+        assert fake_store.added[-1]["text"] == "текст!"
+        assert fake_store.added[-1]["duration_ms"] == 2500
+        notice = instance.window.notice_label.cget("text")
+        assert "Пунктуация и грамматика: 2 правок" in notice, notice
+        assert "Спорных слов: 1" in notice, notice
+        assert instance.window._suggested_count == 1
+        assert instance._suggestions and instance._suggestions[0].word == "текст"
+    finally:
+        winapi.set_clipboard_text(previous_clipboard)
+        instance._quit_ui()
+        root.update()
+
+
+def test_manual_postprocess_button() -> None:
+    import app as app_module
+
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    try:
+        instance.settings["autoPostprocess"] = False
+        instance.postprocess = _FakePostprocess()
+        instance.window.set_text("текст без знака")
+        instance._punctuation_clicked()
+        root.update()
+        assert instance.window.get_text() == "текст без знака!"
+        assert "Пунктуация и грамматика: 2 правок" in instance.window.notice_label.cget("text")
+    finally:
+        instance._quit_ui()
+        root.update()
+
+
+def test_suggestions_choices_apply_text() -> None:
+    import app as app_module
+
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    try:
+        suggestion = _FakeSuggestion("текст", ["тест"])
+        instance.postprocess = _FakePostprocess([suggestion])
+        instance._suggestions = [suggestion]
+        instance.window.set_text("текст!")
+        instance._on_suggestions_applied({0: "тест"})
+        root.update()
+        assert instance.window.get_text() == "тест!"
+        assert instance.last_text == "тест!"
+        assert instance._suggestions == []
+        assert instance.window._suggested_count == 0
+        assert "применено 1" in instance.window.notice_label.cget("text")
+    finally:
+        instance._quit_ui()
+        root.update()
+
+
+def test_llm_improve_success_and_error() -> None:
+    import app as app_module
+
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    try:
+        instance.settings["llmApiKey"] = "sk-test"
+        instance.window.set_text("исходный текст")
+        calls: list[dict] = []
+
+        def fake_improve(text, **kwargs):
+            calls.append(dict(kwargs))
+            return "улучшенный текст"
+
+        with mock.patch.object(app_module.llm, "improve_text", fake_improve):
+            instance._improve_clicked()
+            assert instance._improve_busy is True
+            assert instance.window.improve_button.cget("text").startswith("УЛУЧШАЮ")
+            instance._improve_thread.join(3.0)
+            _drain_app_events(instance)
+            root.update()
+        assert calls and calls[0]["api_key"] == "sk-test"
+        assert instance.window.get_text() == "улучшенный текст"
+        assert "Улучшено (DeepSeek)" in instance.window.notice_label.cget("text")
+        assert instance._improve_busy is False
+
+        def fake_fail(text, **kwargs):
+            raise app_module.llm.LlmError("DeepSeek отклонил ключ (401)")
+
+        with mock.patch.object(app_module.llm, "improve_text", fake_fail):
+            instance._improve_clicked()
+            instance._improve_thread.join(3.0)
+            _drain_app_events(instance)
+            root.update()
+        assert instance.window.get_text() == "улучшенный текст"
+        assert "401" in instance.window.notice_label.cget("text")
+    finally:
+        instance._quit_ui()
+        root.update()
+
+
+def test_llm_empty_key_opens_settings() -> None:
+    import app as app_module
+
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    opened: list[bool] = []
+    try:
+        instance.settings["llmApiKey"] = ""
+        instance.open_settings = lambda: opened.append(True)
+        instance.window.set_text("текст")
+        instance._improve_clicked()
+        root.update()
+        assert opened == [True]
+        assert "ключ" in instance.window.notice_label.cget("text").lower()
+    finally:
+        instance._quit_ui()
+        root.update()
+
+
+def test_history_window_crud_search_and_copy() -> None:
+    from tkinter import messagebox
+
+    root = get_root()
+    store = _FakeSessionStore(
+        [
+            {
+                "id": "a1",
+                "created_at": "2026-11-07T20:14:00",
+                "ts": 2.0,
+                "duration_ms": 12_000,
+                "text": "первая запись",
+                "model": "small",
+                "source": "dictation",
+                "edited": False,
+            },
+            {
+                "id": "b2",
+                "created_at": "2026-11-07T19:02:00",
+                "ts": 1.0,
+                "duration_ms": 7_000,
+                "text": "вторая запись",
+                "model": "small",
+                "source": "dictation",
+                "edited": False,
+            },
+        ]
+    )
+    window = HistoryWindow(root, store, palette=theme.colors("paper"))
+    try:
+        root.update()
+        assert window.win.title() == "История — Диктовка"
+        assert window.listbox.size() == 2
+        assert window.count_label.cget("text").startswith("[")
+        window.search_entry.insert(0, "вторая")
+        window.refresh()
+        root.update()
+        assert window.listbox.size() == 1
+        assert "вторая" in window.current_text()
+        window.search_entry.delete(0, "end")
+        window.refresh()
+        root.update()
+        window.listbox.selection_clear(0, "end")
+        window.listbox.selection_set(0)
+        window._on_select()
+        root.update()
+        window.text.insert("end", " (правка)")
+        window._on_modified()
+        assert window.save_current() is True
+        assert any(
+            "(правка)" in str(item.get("text")) for item in store.sessions
+        )
+        with mock.patch("dictate.winapi.set_clipboard_text", return_value=True):
+            assert window.copy_current() is True
+        deleted_id = store.sessions[0]["id"]
+        assert window.delete_current() is True
+        assert all(item["id"] != deleted_id for item in store.sessions)
+        with mock.patch.object(messagebox, "askyesno", return_value=True):
+            removed = window.clear_all()
+        root.update()
+        assert removed == len(store.sessions) + 0 or store.count() == 0
+        assert store.count() == 0
+    finally:
+        window.destroy()
+
+
+def test_history_window_unsaved_prompt() -> None:
+    from tkinter import messagebox
+
+    root = get_root()
+    store = _FakeSessionStore(
+        [
+            {
+                "id": "c3",
+                "created_at": "2026-11-07T20:14:00",
+                "ts": 1.0,
+                "duration_ms": 5_000,
+                "text": "запись",
+                "model": "small",
+                "source": "dictation",
+                "edited": False,
+            }
+        ]
+    )
+    window = HistoryWindow(root, store, palette=theme.colors("paper"))
+    try:
+        root.update()
+        window.text.insert("end", " изменено")
+        window._on_modified()
+        with mock.patch.object(messagebox, "askyesnocancel", return_value=None):
+            window.close()
+        assert window.win.winfo_exists(), "окно закрылось, не спросив про правки"
+        with mock.patch.object(messagebox, "askyesnocancel", return_value=False):
+            window.close()
+        root.update()
+        assert not window.win.winfo_exists()
+    finally:
+        try:
+            window.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_settings_postprocess_and_llm_sections() -> None:
+    root = get_root()
+    history_calls: list[bool] = []
+    window = SettingsWindow(
+        root,
+        dict(config.DEFAULTS),
+        on_save=lambda _data: None,
+        on_history=lambda: history_calls.append(True),
+        on_check_key=lambda key, model: (True, f"Ключ работает ({model})."),
+    )
+    try:
+        root.update()
+        assert not window.auto_postprocess_var.get() is False
+        assert not window.suggest_contested_var.get() is False
+        assert window.sessions_limit_scale.get() == 300
+        assert window.llm_model_combo.get() == "deepseek-chat"
+        assert window.llm_preset_combo.get() == "Стандарт"
+        assert window.llm_strength_scale.get() == 3
+        assert window.llm_quality_scale.get() == 3
+        assert window.llm_key_entry.cget("show") == "•"
+        window._toggle_key_visibility()
+        assert window.llm_key_entry.cget("show") == ""
+        window.history_settings_button.invoke()
+        assert history_calls == [True]
+        window.llm_key_entry.insert(0, "sk-test")
+        window.llm_model_combo.set("deepseek-reasoner")
+        assert window.check_key_sync() == (True, "Ключ работает (deepseek-reasoner).")
+        window.llm_preset_combo.set("Сильно")
+        window._on_llm_preset()
+        assert window.llm_strength_scale.get() == 5
+        window.llm_strength_scale.set(4)
+        window.llm_quality_scale.set(2)
+        window.auto_postprocess_var.set(False)
+        window.suggest_contested_var.set(False)
+        window.sessions_limit_scale.set(120)
+        data = window.get_settings()
+        assert data["llmApiKey"] == "sk-test"
+        assert data["llmModel"] == "deepseek-reasoner"
+        assert data["llmPreset"] == "strong"
+        assert data["llmStrength"] == 4
+        assert data["llmQuality"] == 2
+        assert data["autoPostprocess"] is False
+        assert data["suggestContested"] is False
+        assert data["sessionsLimit"] == 120
+    finally:
+        window.destroy()
+
+
+def test_tray_has_history_item() -> None:
+    import types as _types
+
+    from dictate.tray import TrayIcon
+
+    called: list[bool] = []
+    app = _types.SimpleNamespace(
+        settings={},
+        open_history=lambda: called.append(True),
+        show_window=lambda: None,
+        open_settings=lambda: None,
+        toggle_autostart=lambda _enabled: None,
+        quit=lambda: None,
+    )
+    tray = TrayIcon(app)
+    tray._on_history()
+    assert called == [True]
+
+
+def test_app_open_history_window() -> None:
+    import app as app_module
+
+    root = get_root()
+    instance = make_isolated_app(app_module)
+    try:
+        instance.store = _FakeSessionStore()
+        instance._open_history_ui()
+        root.update()
+        assert instance.history_window is not None
+        assert instance.history_window.win.title() == "История — Диктовка"
+        instance.history_window.destroy()
+        instance.history_window = None
+    finally:
+        instance._quit_ui()
+        root.update()
 
 
 # --------------------------------------------------------------------------- runner
@@ -1875,6 +2437,18 @@ TESTS = [
     ("app_save_free_hotkey_applied_immediately", test_app_save_free_hotkey_applied_immediately),
     ("startup_settings_logged", test_startup_settings_logged),
     ("selftest_json_valid", test_selftest_json_valid),
+    ("postprocess_buttons_visible", test_postprocess_buttons_visible),
+    ("about_paths_use_data_dir", test_about_paths_use_data_dir),    ("suggestions_window_apply", test_suggestions_window_apply),
+    ("auto_postprocess_on_done", test_auto_postprocess_on_done),
+    ("manual_postprocess_button", test_manual_postprocess_button),
+    ("suggestions_choices_apply_text", test_suggestions_choices_apply_text),
+    ("llm_improve_success_and_error", test_llm_improve_success_and_error),
+    ("llm_empty_key_opens_settings", test_llm_empty_key_opens_settings),
+    ("history_window_crud_search_and_copy", test_history_window_crud_search_and_copy),
+    ("history_window_unsaved_prompt", test_history_window_unsaved_prompt),
+    ("settings_postprocess_and_llm_sections", test_settings_postprocess_and_llm_sections),
+    ("tray_has_history_item", test_tray_has_history_item),
+    ("app_open_history_window", test_app_open_history_window),
 ]
 
 

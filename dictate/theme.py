@@ -31,7 +31,7 @@ TRAY_ICON_PATH = ICONS_DIR / "windictate-tray-64.png"
 APP_NAME = "WinDictate"
 APP_TITLE = "Диктовка"
 APP_KICKER = "ЛОКАЛЬНОЕ РАСПОЗНАВАНИЕ"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 # --- палитра (DESIGN.md §Color Palette) --------------------------------------
 PAPER = "#FFFFFF"

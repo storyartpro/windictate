@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-11-07
+
+### Added
+
+- **Session history** — every dictation is stored in `sessions.json` (time, duration, model,
+  edited text). The new History window lists, searches, opens, edits, copies and deletes
+  sessions; the store keeps the last 300 sessions (configurable 20–1000) and migrates the old
+  `history.json` format automatically.
+- **Local post-processing** — after dictation the app fixes spaces, dashes (`—`), sentence
+  capitalisation, terminal punctuation and safe commas (conjunctions, introductory words,
+  «который…»), plus a set of common grammar slip-ups. Everything is undoable with `Ctrl+Z`.
+- **Contested words** — the post-processor flags suspicious fragments (`-ться/-тся`, merged
+  «не», Latin letters inside Cyrillic words, frequent typos, very short words) and offers
+  correction variants in a review dialog; nothing is changed without confirmation.
+- **«Improve text» via DeepSeek API** — one click sends the current (edited) transcript to
+  DeepSeek and replaces it with the improved version. Presets (Мягко / Стандарт / Сильно) and
+  sliders for strength and quality; API key, model (`deepseek-chat` / `deepseek-reasoner`) and
+  a «Проверить ключ» button live in the new settings section. Requests are made only when the
+  button is pressed; the key is kept in `settings.json` and never logged.
+- Settings sections `07 / Постобработка` and `08 / Улучшение текста`; new keys
+  `autoPostprocess`, `suggestContested`, `sessionsLimit`, `llmApiKey`, `llmModel`, `llmPreset`,
+  `llmStrength`, `llmQuality`.
+- `tests/test_llm.py` (30 checks) and CI step for the LLM client; post-processing and history
+  covered by new core tests (49 total).
+
+### Changed
+
+- Version bump to **0.2.0** (app, launcher, install entry).
+- README/README.ru document history, post-processing and the optional DeepSeek integration.
+
 ## [0.1.0] — 2026-11-07
 
 First public release.

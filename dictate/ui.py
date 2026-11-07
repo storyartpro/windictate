@@ -438,6 +438,552 @@ class BrandButton(tk.Canvas):
         self._draw()
 
 
+class SuggestionsWindow(tk.Toplevel):
+    """Модальное окно «спорных слов»: вариант на каждое слово или «оставить как есть»."""
+
+    TITLE = "Спорные слова — Диктовка"
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        suggestions: list[Any],
+        palette: dict[str, Any],
+        *,
+        on_apply: Callable[[dict[int, str | None]], Any] | None = None,
+        ui_scale: float = 1.0,
+    ) -> None:
+        super().__init__(master)
+        self.palette = palette
+        self.suggestions = list(suggestions)
+        self.choices: dict[int, str | None] = {index: None for index in range(len(self.suggestions))}
+        self.on_apply = on_apply
+        self._scale = clamp_ui_scale(ui_scale)
+        self._buttons: dict[tuple[int, int | None], BrandButton] = {}
+        self.title(self.TITLE)
+        self.configure(bg=palette["bg"])
+        width = _px(660, self._scale)
+        height = _px(520, self._scale)
+        self.geometry(f"{width}x{height}")
+        try:
+            self.transient(master.winfo_toplevel())
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._build()
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _build(self) -> None:
+        palette = self.palette
+        scale = self._scale
+        outer = tk.Frame(self, bg=palette["bg"])
+        outer.pack(fill="both", expand=True)
+
+        header = tk.Frame(
+            outer, bg=palette["bg"], height=_px(54, scale),
+            padx=_px(16, scale), pady=_px(8, scale),
+        )
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(
+            header, text=theme.micro("Спорные слова"), bg=palette["bg"],
+            fg=palette["accent"], font=theme.font_text(10, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            header,
+            text=theme.micro(f"{len(self.suggestions)} слов"),
+            bg=palette["bg"],
+            fg=palette["text_muted"],
+            font=theme.font_text(9),
+        ).pack(side="right")
+        tk.Frame(outer, bg=palette["border"], height=1).pack(fill="x")
+
+        holder = tk.Frame(outer, bg=palette["bg"])
+        holder.pack(fill="both", expand=True)
+        canvas = tk.Canvas(holder, bg=palette["bg"], highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas, bg=palette["bg"])
+        window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.columnconfigure(0, weight=1)
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=int(event.width)))
+        body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        self.canvas = canvas
+        self.scrollbar = scrollbar
+
+        for index, suggestion in enumerate(self.suggestions):
+            self._build_row(body, index, suggestion)
+
+        tk.Frame(outer, bg=palette["border"], height=1).pack(fill="x")
+        bottom = tk.Frame(
+            outer, bg=palette["bg"], padx=_px(16, scale), pady=_px(8, scale)
+        )
+        bottom.pack(fill="x")
+        tk.Label(
+            bottom,
+            text=theme.micro("Выберите вариант или оставьте как есть"),
+            bg=palette["bg"],
+            fg=palette["text_muted"],
+            font=theme.font_text(9),
+        ).pack(side="left")
+        self.apply_button = BrandButton(
+            bottom, "ПРИМЕНИТЬ ВЫБРАННОЕ", self.apply, palette=palette,
+            kind="cta", height=_px(40, scale), font=theme.font_display(11, "bold"),
+        )
+        self.apply_button.pack(side="right", padx=(8, 0))
+        self.cancel_button = BrandButton(
+            bottom, "ОТМЕНА", self.destroy, palette=palette,
+            kind="secondary", height=_px(40, scale), font=theme.font_text(11),
+        )
+        self.cancel_button.pack(side="right")
+
+    def _build_row(self, body: tk.Frame, index: int, suggestion: Any) -> None:
+        palette = self.palette
+        scale = self._scale
+        row = tk.Frame(body, bg=palette["bg"], padx=_px(16, scale), pady=_px(10, scale))
+        row.grid(row=index, column=0, sticky="ew")
+        row.columnconfigure(1, weight=1)
+        tk.Frame(body, bg=palette["border"], height=1).grid(
+            row=index, column=0, sticky="sew"
+        )
+        word = str(getattr(suggestion, "word", "") or "")
+        reason = str(getattr(suggestion, "reason", "") or "")
+        tk.Label(
+            row, text=word, bg=palette["bg"], fg=palette["text"],
+            font=theme.font_display(14, "bold"), anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, _px(12, scale)))
+        tk.Label(
+            row, text=reason, bg=palette["bg"], fg=palette["text_muted"],
+            font=theme.font_text(10), anchor="w",
+        ).grid(row=1, column=0, sticky="w", padx=(0, _px(12, scale)))
+        options = tk.Frame(row, bg=palette["bg"])
+        options.grid(row=0, column=1, rowspan=2, sticky="w")
+        variants = list(getattr(suggestion, "variants", []) or [])
+        for option_index, variant in enumerate(variants):
+            button = BrandButton(
+                options, str(variant), palette=palette, kind="secondary",
+                font=theme.font_text(11), height=_px(30, scale),
+                command=lambda idx=index, value=str(variant): self._choose(idx, value),
+            )
+            button.pack(side="left", padx=(0, _px(6, scale)))
+            self._buttons[(index, variant)] = button
+        keep = BrandButton(
+            options, "ОСТАВИТЬ КАК ЕСТЬ", palette=palette, kind="ghost",
+            font=theme.font_text(10), height=_px(30, scale),
+            command=lambda idx=index: self._choose(idx, None),
+        )
+        keep.pack(side="left")
+        self._buttons[(index, None)] = keep
+
+    def _choose(self, index: int, value: str | None) -> None:
+        self.choices[index] = value
+        for (row_index, option), button in self._buttons.items():
+            if row_index != index:
+                continue
+            selected = option == value
+            button.kind = "cta" if selected else (
+                "ghost" if option is None else "secondary"
+            )
+            button._draw()
+
+    def apply(self) -> None:
+        callback = self.on_apply
+        choices = dict(self.choices)
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        if callback is not None:
+            try:
+                callback(choices)
+            except Exception:  # noqa: BLE001
+                LOG.exception("Ошибка применения спорных слов")
+
+
+class HistoryWindow(tk.Toplevel):
+    """Окно истории диктовок: список сессий, поиск, редактирование текста."""
+
+    TITLE = "История — Диктовка"
+    WIDTH = 860
+    HEIGHT = 520
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        store: Any,
+        *,
+        palette: dict[str, Any] | None = None,
+        on_close: Callable[[], Any] | None = None,
+        ui_scale: float = 1.0,
+    ) -> None:
+        super().__init__(master)
+        self.win = self  # удобный алиас, как у DictationWindow/SettingsWindow
+        self.store = store
+        self.palette = palette or theme.colors(theme.DEFAULT_THEME)
+        self.on_close = on_close
+        self._scale = clamp_ui_scale(ui_scale)
+        self._sessions: list[dict[str, Any]] = []
+        self._current_id: str | None = None
+        self._dirty = False
+        self.title(self.TITLE)
+        self.configure(bg=self.palette["bg"])
+        width = _px(self.WIDTH, self._scale)
+        height = _px(self.HEIGHT, self._scale)
+        self.geometry(f"{width}x{height}")
+        self.minsize(_px(620, self._scale), _px(380, self._scale))
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        palette = self.palette
+        scale = self._scale
+        outer = tk.Frame(self, bg=palette["bg"])
+        outer.pack(fill="both", expand=True)
+
+        header = tk.Frame(
+            outer, bg=palette["bg"], height=_px(54, scale),
+            padx=_px(16, scale), pady=_px(8, scale),
+        )
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(
+            header, text=theme.micro("История"), bg=palette["bg"],
+            fg=palette["accent"], font=theme.font_text(10, "bold"),
+        ).pack(side="left")
+        self.count_label = tk.Label(
+            header, text=theme.micro("0 записей"), bg=palette["bg"],
+            fg=palette["text_muted"], font=theme.font_text(9),
+        )
+        self.count_label.pack(side="right")
+        tk.Frame(outer, bg=palette["border"], height=1).pack(fill="x")
+
+        body = tk.Frame(outer, bg=palette["bg"])
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=0, minsize=_px(310, scale))
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, bg=palette["bg"], padx=_px(16, scale), pady=_px(10, scale))
+        left.grid(row=0, column=0, sticky="nsew")
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+        search_row = tk.Frame(left, bg=palette["bg"])
+        search_row.grid(row=0, column=0, sticky="ew", pady=(0, _px(6, scale)))
+        search_row.columnconfigure(1, weight=1)
+        tk.Label(
+            search_row, text=theme.micro("Поиск"), bg=palette["bg"],
+            fg=palette["text_muted"], font=theme.font_text(9),
+        ).grid(row=0, column=0, padx=(0, _px(8, scale)))
+        self.search_entry = tk.Entry(
+            search_row, bg=palette["surface"], fg=palette["text"],
+            insertbackground=palette["accent"], relief="flat", bd=0,
+            font=theme.font_text(11), highlightthickness=1, width=1,
+            highlightbackground=palette["border"], highlightcolor=palette["accent"],
+        )
+        self.search_entry.grid(row=0, column=1, sticky="ew", ipady=_px(5, scale))
+        self.search_entry.bind("<KeyRelease>", lambda _event: self.refresh())
+        self.listbox = tk.Listbox(
+            left, bg=palette["surface"], fg=palette["text"],
+            selectbackground=palette["accent_soft"], selectforeground=palette["text"],
+            relief="flat", bd=0, highlightthickness=1, width=1,
+            highlightbackground=palette["border"], highlightcolor=palette["border"],
+            font=theme.font_text(10), activestyle="none",
+        )
+        self.listbox.grid(row=1, column=0, sticky="nsew")
+        self.listbox.bind("<<ListboxSelect>>", lambda _event: self._on_select())
+
+        right = tk.Frame(body, bg=palette["bg"], padx=_px(16, scale), pady=_px(10, scale))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+        self.session_label = tk.Label(
+            right, text=theme.micro("Выберите запись"), bg=palette["bg"],
+            fg=palette["text_muted"], font=theme.font_text(9), anchor="w",
+        )
+        self.session_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, _px(4, scale)))
+        self.text = tk.Text(
+            right, bg=palette["surface"], fg=palette["text"],
+            insertbackground=palette["accent"], selectbackground=palette["accent_soft"],
+            selectforeground=palette["text"], relief="flat", bd=0, width=1,
+            font=theme.font_text(12), undo=True, wrap="word",
+            padx=_px(10, scale), pady=_px(8, scale),
+            highlightthickness=1, highlightbackground=palette["border"],
+            highlightcolor=palette["border"],
+        )
+        self.text.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.text.bind("<<Modified>>", self._on_modified)
+
+        buttons = tk.Frame(right, bg=palette["bg"])
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(_px(8, scale), 0))
+        self.save_button = BrandButton(
+            buttons, "СОХРАНИТЬ", self.save_current, palette=palette, kind="cta",
+            height=_px(36, scale), padding=_px(8, scale), font=theme.font_display(10, "bold"),
+        )
+        self.save_button.pack(side="left")
+        self.copy_button = BrandButton(
+            buttons, "КОПИРОВАТЬ", self.copy_current, palette=palette, kind="secondary",
+            height=_px(36, scale), padding=_px(8, scale), font=theme.font_text(10),
+        )
+        self.copy_button.pack(side="left", padx=(_px(4, scale), 0))
+        self.delete_button = BrandButton(
+            buttons, "УДАЛИТЬ", self.delete_current, palette=palette, kind="ghost",
+            height=_px(36, scale), padding=_px(8, scale), font=theme.font_text(10),
+        )
+        self.delete_button.pack(side="left", padx=(_px(8, scale), 0))
+        self.clear_button = BrandButton(
+            buttons, "ОЧИСТИТЬ ВСЁ", self.clear_all, palette=palette, kind="ghost",
+            height=_px(36, scale), padding=_px(8, scale), font=theme.font_text(10),
+        )
+        self.clear_button.pack(side="left", padx=(_px(4, scale), 0))
+        self.close_button = BrandButton(
+            buttons, "ЗАКРЫТЬ", self.close, palette=palette, kind="ghost",
+            height=_px(36, scale), padding=_px(8, scale), font=theme.font_text(10),
+        )
+        self.close_button.pack(side="left", padx=(_px(4, scale), 0))
+
+        self.status_label = tk.Label(
+            outer, text="", bg=palette["bg"], fg=palette["text_muted"],
+            font=theme.font_text(9), anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=_px(16, scale), pady=(0, _px(6, scale)))
+
+    # -- data -------------------------------------------------------------
+
+    def refresh(self) -> None:
+        query = ""
+        try:
+            query = str(self.search_entry.get()).strip()
+        except tk.TclError:
+            pass
+        try:
+            sessions = list(self.store.list(query) or [])
+        except Exception:  # noqa: BLE001
+            sessions = []
+        self._sessions = sessions
+        self.listbox.delete(0, "end")
+        for session in sessions:
+            self.listbox.insert("end", self._format_row(session))
+        self.count_label.configure(text=theme.micro(f"{len(sessions)} записей"))
+        if sessions:
+            self.listbox.selection_set(0)
+            self._load_session(sessions[0])
+        else:
+            self._current_id = None
+            self.session_label.configure(text=theme.micro("Записей нет"))
+            self._set_text("")
+            self._dirty = False
+
+    @staticmethod
+    def _format_row(session: dict[str, Any]) -> str:
+        created = str(session.get("created_at") or "")
+        stamp = created[8:10] + "." + created[5:7] + " " + created[11:16] if len(created) >= 16 else created
+        duration = int(session.get("duration_ms") or 0) // 1000
+        text = str(session.get("text") or "").replace("\n", " ")
+        return f"{stamp}  {duration // 60}:{duration % 60:02d}  {text[:60]}"
+
+    def _on_select(self) -> None:
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self._sessions):
+            return
+        session = self._sessions[index]
+        session_id = str(session.get("id") or "")
+        if self._dirty and session_id != self._current_id:
+            if not self._confirm_discard():
+                self._reselect_current()
+                return
+        self._load_session(session)
+
+    def _reselect_current(self) -> None:
+        for index, session in enumerate(self._sessions):
+            if str(session.get("id") or "") == self._current_id:
+                self.listbox.selection_clear(0, "end")
+                self.listbox.selection_set(index)
+                return
+
+    def _load_session(self, session: dict[str, Any]) -> None:
+        self._current_id = str(session.get("id") or "")
+        created = str(session.get("created_at") or "")
+        duration = int(session.get("duration_ms") or 0) // 1000
+        stamp = (
+            created[8:10] + "." + created[5:7] + " " + created[11:16]
+            if len(created) >= 16
+            else created
+        )
+        self.session_label.configure(
+            text=f"{theme.micro('Запись')}  {stamp}  ·  {duration // 60}:{duration % 60:02d}"
+        )
+        self._set_text(str(session.get("text") or ""))
+        self._dirty = False
+        try:
+            self.save_button.set_enabled(False)
+        except tk.TclError:
+            pass
+        self.set_status("")
+
+    def _set_text(self, value: str) -> None:
+        try:
+            self.text.configure(state="normal")
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", value)
+            self.text.edit_modified(False)
+        except tk.TclError:
+            pass
+
+    def _on_modified(self, _event: tk.Event | None = None) -> None:
+        try:
+            modified = bool(self.text.edit_modified())
+        except tk.TclError:
+            return
+        if not modified:
+            return
+        self._dirty = True
+        self.save_button.set_enabled(True)
+
+    def _confirm_discard(self) -> bool:
+        from tkinter import messagebox
+
+        try:
+            return bool(
+                messagebox.askyesno(
+                    "История — Диктовка",
+                    "Сохранить изменения текущей записи?",
+                    parent=self,
+                )
+            )
+        except tk.TclError:
+            return False
+
+    def current_text(self) -> str:
+        try:
+            return self.text.get("1.0", "end-1c")
+        except tk.TclError:
+            return ""
+
+    def set_status(self, text: str, error: bool = False) -> None:
+        try:
+            self.status_label.configure(
+                text=text, fg=self.palette["danger"] if error else self.palette["text_muted"]
+            )
+        except tk.TclError:
+            pass
+
+    # -- operations -------------------------------------------------------
+
+    def save_current(self) -> bool:
+        if self._current_id is None:
+            return False
+        text = self.current_text()
+        try:
+            ok = bool(self.store.update_text(self._current_id, text))
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"Не удалось сохранить: {exc}", error=True)
+            return False
+        if not ok:
+            self.set_status("Не удалось сохранить запись", error=True)
+            return False
+        self._dirty = False
+        try:
+            self.save_button.set_enabled(False)
+        except tk.TclError:
+            pass
+        self.set_status("Сохранено")
+        self.refresh()
+        return True
+
+    def copy_current(self) -> bool:
+        text = self.current_text()
+        from dictate import winapi
+
+        try:
+            ok = bool(winapi.set_clipboard_text(text))
+        except Exception:  # noqa: BLE001
+            ok = False
+        self.set_status("Скопировано в буфер" if ok else "Не удалось скопировать", error=not ok)
+        return ok
+
+    def delete_current(self) -> bool:
+        if self._current_id is None:
+            return False
+        try:
+            ok = bool(self.store.delete(self._current_id))
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"Не удалось удалить: {exc}", error=True)
+            return False
+        self._current_id = None
+        self._dirty = False
+        self.set_status("Запись удалена" if ok else "Не удалось удалить")
+        self.refresh()
+        return ok
+
+    def clear_all(self) -> int:
+        from tkinter import messagebox
+
+        try:
+            confirmed = bool(
+                messagebox.askyesno(
+                    "История — Диктовка",
+                    "Удалить все записи истории? Это действие нельзя отменить.",
+                    parent=self,
+                )
+            )
+        except tk.TclError:
+            confirmed = False
+        if not confirmed:
+            return 0
+        try:
+            removed = int(self.store.clear() or 0)
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"Не удалось очистить: {exc}", error=True)
+            return 0
+        self._current_id = None
+        self._dirty = False
+        self.set_status(f"Удалено записей: {removed}")
+        self.refresh()
+        return removed
+
+    def close(self) -> None:
+        if self._dirty:
+            try:
+                from tkinter import messagebox
+
+                answer = messagebox.askyesnocancel(
+                    "История — Диктовка",
+                    "Сохранить изменения перед закрытием?",
+                    parent=self,
+                )
+            except tk.TclError:
+                answer = None
+            if answer is True:
+                self.save_current()
+            elif answer is None:
+                return
+        callback = self.on_close
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                LOG.exception("Ошибка закрытия истории")
+
+    def show(self) -> None:
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+
 class BrandCheck(tk.Frame):
     """Чекбокс канона: квадрат 12×12, рамка 1 px, отмечен — заливка accent."""
 
@@ -726,6 +1272,8 @@ class DictationWindow:
         self._notice_text = ""
         self._notice_is_error = False
         self._icons = icons_available()
+        self._suggestions_window: SuggestionsWindow | None = None
+        self._improve_busy = False
         self._x = 0
         self._y = 0
 
@@ -991,11 +1539,70 @@ class DictationWindow:
             widget.grid(row=0, column=self.column, padx=(6, 0))
             self.column += 1
 
+        # Компактные иконочные действия постобработки — в том же ряду.
+        self.compact_action_buttons: list[BrandButton] = []
+        for icon, tooltip, event in (
+            ("edit", "Пунктуация и грамматика", "punctuation"),
+            ("refresh", "Улучшить текст (DeepSeek)", "improve"),
+            ("info", "История диктовок", "history"),
+            ("warning", "Спорные слова", "contested"),
+        ):
+            button = BrandButton(
+                self.buttons, palette=palette, kind="icon", icon=icon, icon_only=True,
+                height=_px(40, scale), font=icon_btn_font,
+                tooltip=tooltip, command=lambda name=event: self._fire(name),
+            )
+            button.grid(row=0, column=self.column, padx=(6, 0))
+            button.grid_remove()
+            self.column += 1
+            self.compact_action_buttons.append(button)
+        (
+            self.compact_punctuation_button,
+            self.compact_improve_button,
+            self.compact_history_button,
+            self.compact_contested_button,
+        ) = self.compact_action_buttons
+
         # Линия над нижней панелью.
         self.bottom_separator = tk.Frame(
             self.inner, bg=palette["border"], height=_px(1, scale)
         )
         self.bottom_separator.pack(side="bottom", fill="x")
+
+        # Строка действий постобработки: пунктуация / улучшение / история / спорные.
+        self._suggested_count = 0
+        self.actions_bar = tk.Frame(
+            self.inner, bg=palette["bg"],
+            padx=_px(12 if compact else 16, scale),
+            pady=_px(2, scale),
+        )
+        self.actions_bar.pack(side="bottom", fill="x")
+        action_font = theme.font_text(10)
+        self.punctuation_button = BrandButton(
+            self.actions_bar, "ПУНКТУАЦИЯ →", lambda: self._fire("punctuation"),
+            palette=palette, kind="ghost", icon="edit", height=_px(26, scale),
+            font=action_font, tooltip="Пунктуация и грамматика",
+        )
+        self.punctuation_button.pack(side="left")
+        self.improve_button = BrandButton(
+            self.actions_bar, "УЛУЧШИТЬ →", lambda: self._fire("improve"),
+            palette=palette, kind="ghost", icon="refresh", height=_px(26, scale),
+            font=action_font, tooltip="Улучшить текст (DeepSeek)",
+        )
+        self.improve_button.pack(side="left", padx=(_px(10, scale), 0))
+        self.history_button = BrandButton(
+            self.actions_bar, "ИСТОРИЯ →", lambda: self._fire("history"),
+            palette=palette, kind="ghost", icon="info", height=_px(26, scale),
+            font=action_font, tooltip="История диктовок",
+        )
+        self.history_button.pack(side="left", padx=(_px(10, scale), 0))
+        self.contested_button = BrandButton(
+            self.actions_bar, "СПОРНЫЕ СЛОВА →", lambda: self._fire("contested"),
+            palette=palette, kind="ghost", icon="warning", height=_px(26, scale),
+            font=action_font, tooltip="Проверить спорные слова",
+        )
+        self.contested_button.pack(side="left", padx=(_px(10, scale), 0))
+        self.contested_button.pack_forget()
 
         # Карточка текста.
         self.text_container = tk.Frame(self.inner, bg=palette["bg"])
@@ -1083,6 +1690,121 @@ class DictationWindow:
                 button._icon_only = compact
                 button.set_text(text)
             self.text.configure(height=2 if compact else 6)
+        except tk.TclError:
+            pass
+        self._update_actions_visibility()
+
+    def _update_actions_visibility(self) -> None:
+        """Показывает строку постобработки в idle; в compact — иконки."""
+        compact = self.size_mode == "compact"
+        idle = self.state == "idle"
+        try:
+            if compact:
+                if self.actions_bar.winfo_manager():
+                    self.actions_bar.pack_forget()
+                for index, button in enumerate(self.compact_action_buttons):
+                    if not idle:
+                        if button.winfo_manager():
+                            button.grid_remove()
+                        continue
+                    if index == 3 and not self._suggested_count:
+                        if button.winfo_manager():
+                            button.grid_remove()
+                        continue
+                    if not button.winfo_manager():
+                        button.grid()
+            else:
+                for button in self.compact_action_buttons:
+                    if button.winfo_manager():
+                        button.grid_remove()
+                if idle:
+                    if not self.actions_bar.winfo_manager():
+                        self.actions_bar.pack(
+                            side="bottom", fill="x", before=self.bottom_separator
+                        )
+                elif self.actions_bar.winfo_manager():
+                    self.actions_bar.pack_forget()
+            # «Спорные слова» — только когда есть suggestions.
+            visible = idle and bool(self._suggested_count)
+            if compact:
+                if not visible and self.compact_contested_button.winfo_manager():
+                    self.compact_contested_button.grid_remove()
+            elif visible:
+                if not self.contested_button.winfo_manager():
+                    self.contested_button.pack(
+                        side="left", padx=(_px(10, self.ui_scale), 0)
+                    )
+            elif self.contested_button.winfo_manager():
+                self.contested_button.pack_forget()
+        except tk.TclError:
+            pass
+
+    def set_contested(self, count: int) -> None:
+        """Сколько «спорных» слов нашла постобработка (0 — скрыть кнопку)."""
+        self._suggested_count = max(0, int(count))
+        label = (
+            f"СПОРНЫЕ СЛОВА: {self._suggested_count} →"
+            if self._suggested_count
+            else "СПОРНЫЕ СЛОВА →"
+        )
+        try:
+            self.contested_button.set_text(label)
+        except tk.TclError:
+            pass
+        self._update_actions_visibility()
+
+    def set_improve_busy(self, busy: bool) -> None:
+        """Блокирует «Улучшить», пока идёт запрос к DeepSeek."""
+        self._improve_busy = bool(busy)
+        label = "УЛУЧШАЮ…" if busy else "УЛУЧШИТЬ →"
+        for button in (
+            self.improve_button, self.compact_improve_button,
+        ):
+            try:
+                button.set_enabled(not busy)
+                button.set_text(label)
+            except tk.TclError:
+                pass
+
+    def show_suggestions(self, suggestions: list[Any]) -> SuggestionsWindow | None:
+        """Открывает модальное окно «спорных слов»; результат — callback suggestions."""
+        if not suggestions:
+            return None
+        try:
+            if self._suggestions_window is not None:
+                self._suggestions_window.destroy()
+        except tk.TclError:
+            pass
+
+        def _applied(choices: dict[int, str | None]) -> None:
+            self._suggestions_window = None
+            self._fire("suggestions", choices)
+
+        try:
+            self._suggestions_window = SuggestionsWindow(
+                self.win,
+                suggestions,
+                self.palette,
+                on_apply=_applied,
+                ui_scale=self.ui_scale,
+            )
+        except Exception:  # noqa: BLE001
+            LOG.exception("Не удалось открыть окно спорных слов")
+            self._suggestions_window = None
+        return self._suggestions_window
+
+    def set_text_undo(self, text: str) -> None:
+        """Заменяет текст, сохраняя undo-историю (Ctrl+Z отменяет правку)."""
+        try:
+            self.text.configure(state="normal")
+            self.text.edit_separator()
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", text or "")
+            self.text.edit_separator()
+            self.text.see("end")
+            if self.state in ("recording", "finalizing"):
+                self.text.configure(state="disabled")
+            self._refresh_buttons()
         except tk.TclError:
             pass
 
@@ -1462,12 +2184,12 @@ class DictationWindow:
         except tk.TclError:
             self._pulse_job = None
 
-    def _fire(self, name: str) -> None:
+    def _fire(self, name: str, *args: Any) -> None:
         callback = self.callbacks.get(name)
         if callback is None:
             return
         try:
-            callback()
+            callback(*args)
         except Exception:  # noqa: BLE001
             LOG.exception("Ошибка обработчика окна: %s", name)
 
@@ -1572,6 +2294,8 @@ class SettingsWindow:
         on_model_status: Callable[[], tuple[str, bool]] | None = None,
         on_settings_size: Callable[[int, int], Any] | None = None,
         on_open_logs: Callable[[], Any] | None = None,
+        on_history: Callable[[], Any] | None = None,
+        on_check_key: Callable[[str, str], tuple[bool, str]] | None = None,
     ) -> None:
         self.settings = dict(settings)
         self.on_save = on_save
@@ -1581,6 +2305,8 @@ class SettingsWindow:
         self.on_model_status = on_model_status
         self.on_settings_size = on_settings_size
         self.on_open_logs = on_open_logs
+        self.on_history = on_history
+        self.on_check_key = on_check_key
 
         self.visible = False
         self.ui_scale = clamp_ui_scale(self.settings.get("uiScale", 1.0))
@@ -1781,6 +2507,8 @@ class SettingsWindow:
         self._build_control_section(3)
         self._build_behavior_section(4)
         self._build_about_section(5)
+        self._build_postprocess_section(6)
+        self._build_llm_section(7)
 
         bottom_line = tk.Frame(outer, bg=palette["border"], height=_px(1, scale))
         bottom_line.pack(fill="x")
@@ -2224,13 +2952,259 @@ class SettingsWindow:
 
     # -- section 6: about --------------------------------------------------
 
+    # -- section 7: postprocess -------------------------------------------
+
+    def _build_postprocess_section(self, row: int) -> None:
+        scale = self.ui_scale
+        card = self._card(row, "settings", "07 / Постобработка", "Постобработка")
+        self.auto_postprocess_var = tk.BooleanVar(
+            value=bool(self.settings.get("autoPostprocess", True))
+        )
+        BrandCheck(
+            card, "Пунктуация и грамматика после диктовки", self.auto_postprocess_var,
+            palette=self.palette, bg=self._section_bg,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, _px(4, scale)))
+        self.suggest_contested_var = tk.BooleanVar(
+            value=bool(self.settings.get("suggestContested", True))
+        )
+        BrandCheck(
+            card, "Показывать спорные слова", self.suggest_contested_var,
+            palette=self.palette, bg=self._section_bg,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, _px(4, scale)))
+
+        self._field_label(card, 3, 0, "Хранить сессий")
+        limit_frame = tk.Frame(card, bg=self._section_bg)
+        limit_frame.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(0, _px(4, scale)))
+        limit_frame.columnconfigure(0, weight=1)
+        self.sessions_limit_scale = BrandSlider(
+            limit_frame, from_=20, to=1000, step=20,
+            value=max(20, min(1000, int(self.settings.get("sessionsLimit", 300)))),
+            palette=self.palette,
+        )
+        self.sessions_limit_scale.grid(row=0, column=0, sticky="ew")
+        self.sessions_limit_label = tk.Label(
+            limit_frame, text=str(int(self.sessions_limit_scale.get())),
+            bg=self._section_bg, fg=self.palette["text_secondary"],
+            font=theme.font_text(10), width=5, anchor="e",
+        )
+        self.sessions_limit_label.grid(row=0, column=1, padx=(_px(8, scale), 0))
+
+        def _on_limit(_value: Any) -> None:
+            try:
+                self.sessions_limit_label.configure(text=str(int(float(_value))))
+            except (tk.TclError, TypeError, ValueError):
+                pass
+
+        self.sessions_limit_scale._command = _on_limit
+
+        self.history_settings_button = BrandButton(
+            card, "ИСТОРИЯ →", self._history_clicked, palette=self.palette,
+            kind="ghost", height=_px(32, scale), font=theme.font_text(10),
+        )
+        self.history_settings_button.grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(_px(2, scale), 0)
+        )
+
+    def _history_clicked(self) -> None:
+        if self.on_history is not None:
+            try:
+                self.on_history()
+            except Exception:  # noqa: BLE001
+                LOG.exception("Ошибка открытия истории из настроек")
+
+    # -- section 8: LLM improvement ---------------------------------------
+
+    def _build_llm_section(self, row: int) -> None:
+        scale = self.ui_scale
+        from dictate import llm as llm_module
+
+        card = self._card(row, "settings", "08 / Улучшение текста", "Улучшение текста")
+
+        self._field_label(card, 1, 0, "API-ключ DeepSeek")
+        key_row = tk.Frame(card, bg=self._section_bg)
+        key_row.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, _px(4, scale)))
+        key_row.columnconfigure(0, weight=1)
+        self.llm_key_entry = tk.Entry(
+            key_row, show="•", bg=self.palette["surface"], fg=self.palette["text"],
+            insertbackground=self.palette["accent"], relief="flat", bd=0,
+            font=theme.font_text(11), highlightthickness=1,
+            highlightbackground=self.palette["border"],
+            highlightcolor=self.palette["accent"],
+        )
+        self.llm_key_entry.insert(0, str(self.settings.get("llmApiKey", "")))
+        self.llm_key_entry.grid(row=0, column=0, sticky="ew", ipady=_px(4, scale))
+        self.show_key_button = BrandButton(
+            key_row, "ПОКАЗАТЬ", self._toggle_key_visibility, palette=self.palette,
+            kind="ghost", height=_px(30, scale), font=theme.font_text(9),
+        )
+        self.show_key_button.grid(row=0, column=1, padx=(_px(6, scale), 0))
+        self._key_visible = False
+
+        self._field_label(card, 2, 0, "Модель")
+        self.llm_model_combo = ttk.Combobox(
+            card, values=list(llm_module.MODELS), state="readonly", style="Sa.TCombobox"
+        )
+        model = str(self.settings.get("llmModel", llm_module.DEFAULT_MODEL))
+        self.llm_model_combo.set(model if model in llm_module.MODELS else llm_module.DEFAULT_MODEL)
+        self.llm_model_combo.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(0, _px(4, scale)))
+
+        self._field_label(card, 3, 0, "Пресет")
+        self.llm_preset_labels = dict(llm_module.PRESETS)
+        self.llm_preset_values = {label: key for key, label in llm_module.PRESETS.items()}
+        self.llm_preset_combo = ttk.Combobox(
+            card, values=list(self.llm_preset_labels.values()),
+            state="readonly", style="Sa.TCombobox",
+        )
+        preset = str(self.settings.get("llmPreset", "standard"))
+        self.llm_preset_combo.set(self.llm_preset_labels.get(preset, "Стандарт"))
+        self.llm_preset_combo.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(0, _px(4, scale)))
+        self.llm_preset_combo.bind("<<ComboboxSelected>>", self._on_llm_preset)
+
+        self._field_label(card, 4, 0, "Сила")
+        strength_frame = tk.Frame(card, bg=self._section_bg)
+        strength_frame.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(0, _px(4, scale)))
+        strength_frame.columnconfigure(0, weight=1)
+        self.llm_strength_scale = BrandSlider(
+            strength_frame, from_=1, to=5, step=1,
+            value=max(1, min(5, int(self.settings.get("llmStrength", 3)))),
+            palette=self.palette,
+        )
+        self.llm_strength_scale.grid(row=0, column=0, sticky="ew")
+        self.llm_strength_label = tk.Label(
+            strength_frame, text=str(int(self.llm_strength_scale.get())),
+            bg=self._section_bg, fg=self.palette["text_secondary"],
+            font=theme.font_text(10), width=3, anchor="e",
+        )
+        self.llm_strength_label.grid(row=0, column=1, padx=(_px(8, scale), 0))
+        self.llm_strength_scale._command = lambda value: self.llm_strength_label.configure(
+            text=str(int(float(value)))
+        )
+
+        self._field_label(card, 5, 0, "Качество")
+        quality_frame = tk.Frame(card, bg=self._section_bg)
+        quality_frame.grid(row=5, column=1, columnspan=3, sticky="ew", pady=(0, _px(4, scale)))
+        quality_frame.columnconfigure(0, weight=1)
+        self.llm_quality_scale = BrandSlider(
+            quality_frame, from_=1, to=5, step=1,
+            value=max(1, min(5, int(self.settings.get("llmQuality", 3)))),
+            palette=self.palette,
+        )
+        self.llm_quality_scale.grid(row=0, column=0, sticky="ew")
+        self.llm_quality_label = tk.Label(
+            quality_frame, text=str(int(self.llm_quality_scale.get())),
+            bg=self._section_bg, fg=self.palette["text_secondary"],
+            font=theme.font_text(10), width=3, anchor="e",
+        )
+        self.llm_quality_label.grid(row=0, column=1, padx=(_px(8, scale), 0))
+        self.llm_quality_scale._command = lambda value: self.llm_quality_label.configure(
+            text=str(int(float(value)))
+        )
+
+        actions = tk.Frame(card, bg=self._section_bg)
+        actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(_px(2, scale), 0))
+        self.llm_check_button = BrandButton(
+            actions, "ПРОВЕРИТЬ КЛЮЧ →", self.check_key, palette=self.palette,
+            kind="ghost", height=_px(32, scale), font=theme.font_text(10),
+        )
+        self.llm_check_button.pack(side="left")
+        self.llm_status_label = tk.Label(
+            actions, text="", bg=self._section_bg, fg=self.palette["text_muted"],
+            font=theme.font_text(9), anchor="w",
+        )
+        self.llm_status_label.pack(side="left", padx=(_px(10, scale), 0))
+        tk.Label(
+            card,
+            text=(
+                "Ключ хранится в settings.json; запросы уходят только по кнопке "
+                "«Улучшить»."
+            ),
+            bg=self._section_bg, fg=self.palette["text_muted"],
+            font=theme.font_text(9), anchor="w", justify="left",
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(_px(6, scale), 0))
+
+    def _toggle_key_visibility(self) -> None:
+        self._key_visible = not self._key_visible
+        try:
+            self.llm_key_entry.configure(show="" if self._key_visible else "•")
+            self.show_key_button.set_text("СКРЫТЬ" if self._key_visible else "ПОКАЗАТЬ")
+        except tk.TclError:
+            pass
+
+    def _on_llm_preset(self, _event: tk.Event | None = None) -> None:
+        from dictate import llm as llm_module
+
+        label = str(self.llm_preset_combo.get())
+        preset = self.llm_preset_values.get(label, "standard")
+        strength, quality = llm_module.PRESET_DEFAULTS.get(preset, (3, 3))
+        try:
+            self.llm_strength_scale.set(strength)
+            self.llm_quality_scale.set(quality)
+            self.llm_strength_label.configure(text=str(strength))
+            self.llm_quality_label.configure(text=str(quality))
+        except tk.TclError:
+            pass
+
+    def check_key_sync(self) -> tuple[bool, str]:
+        """Проверка ключа в текущем потоке (кнопка запускает её в фоне)."""
+        key = self.llm_key_entry.get().strip()
+        model = str(self.llm_model_combo.get()) or "deepseek-chat"
+        if self.on_check_key is not None:
+            try:
+                return self.on_check_key(key, model)
+            except Exception as exc:  # noqa: BLE001
+                return False, f"Не удалось проверить ключ: {exc}"
+        try:
+            from dictate import llm as llm_module
+
+            return llm_module.check_key(key, model=model)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Не удалось проверить ключ: {exc}"
+
+    def check_key(self) -> None:
+        """Кнопка «Проверить ключ»: запрос в фоне, UI не блокируется."""
+        try:
+            self.llm_check_button.set_enabled(False)
+            self.llm_check_button.set_text("ПРОВЕРЯЮ…")
+            self.set_llm_status("Проверяю ключ…", error=False)
+        except tk.TclError:
+            pass
+        import threading
+
+        def worker() -> None:
+            ok, message = self.check_key_sync()
+            try:
+                self.win.after(0, lambda: self._finish_key_check(ok, message))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="WinDictateKeyCheck", daemon=True).start()
+
+    def _finish_key_check(self, ok: bool, message: str) -> None:
+        try:
+            self.llm_check_button.set_enabled(True)
+            self.llm_check_button.set_text("ПРОВЕРИТЬ КЛЮЧ →")
+        except tk.TclError:
+            pass
+        self.set_llm_status(message, error=not ok)
+
+    def set_llm_status(self, message: str, error: bool = False) -> None:
+        try:
+            self.llm_status_label.configure(
+                text=message,
+                fg=self.palette["danger"] if error else self.palette["text_muted"],
+            )
+        except tk.TclError:
+            pass
+
     def _build_about_section(self, row: int) -> None:
+        from dictate import config
+
         scale = self.ui_scale
         card = self._card(row, "info", "06 / О программе", "О программе")
         lines = (
             f"Версия: {theme.APP_VERSION}",
-            f"Каталог: {theme.APP_DIR}",
-            f"Логи: {theme.APP_DIR.parent / 'logs'}",
+            f"Данные: {config.data_dir()}",
+            f"Логи: {config.logs_dir()}",
         )
         for index, line in enumerate(lines, start=1):
             tk.Label(
@@ -2577,6 +3551,16 @@ class SettingsWindow:
                 "sizeMode": SIZE_VALUES.get(self.size_combo.get(), "normal"),
                 "pinned": bool(self.pinned_var.get()),
                 "showElapsed": bool(self.show_elapsed_var.get()),
+                "autoPostprocess": bool(self.auto_postprocess_var.get()),
+                "suggestContested": bool(self.suggest_contested_var.get()),
+                "sessionsLimit": max(20, min(1000, int(float(self.sessions_limit_scale.get())))),
+                "llmApiKey": self.llm_key_entry.get().strip(),
+                "llmModel": str(self.llm_model_combo.get()) or "deepseek-chat",
+                "llmPreset": self.llm_preset_values.get(
+                    str(self.llm_preset_combo.get()), "standard"
+                ),
+                "llmStrength": max(1, min(5, int(float(self.llm_strength_scale.get())))),
+                "llmQuality": max(1, min(5, int(float(self.llm_quality_scale.get())))),
                 "settingsW": max(560, int(self.win.winfo_width() or 0)),
                 "settingsH": max(520, int(self.win.winfo_height() or 0)),
                 "autostart": bool(self.autostart_var.get()),

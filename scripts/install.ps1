@@ -200,7 +200,7 @@ Write-Step 'Регистрирую в «Программах и компонен
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinDictate'
 New-Item -Path $uninstallKey -Force | Out-Null
 Set-ItemProperty -Path $uninstallKey -Name 'DisplayName' -Value 'Диктовка (WinDictate)'
-Set-ItemProperty -Path $uninstallKey -Name 'DisplayVersion' -Value '0.1.0'
+Set-ItemProperty -Path $uninstallKey -Name 'DisplayVersion' -Value '0.2.0'
 Set-ItemProperty -Path $uninstallKey -Name 'Publisher' -Value 'WinDictate'
 Set-ItemProperty -Path $uninstallKey -Name 'DisplayIcon' -Value $launcher
 Set-ItemProperty -Path $uninstallKey -Name 'InstallLocation' -Value $dest

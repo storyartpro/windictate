@@ -31,6 +31,10 @@ jobs:
         shell: pwsh
         run: .venv\Scripts\python.exe tests\test_core.py
 
+      - name: LLM client tests (no network)
+        shell: pwsh
+        run: .venv\Scripts\python.exe tests\test_llm.py
+
       - name: UI tests
         shell: pwsh
         run: .venv\Scripts\python.exe tests\test_shell.py
