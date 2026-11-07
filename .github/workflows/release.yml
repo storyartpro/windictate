@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build launcher
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-launcher.ps1
+
+      - name: Build portable zip
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-portable.ps1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/WinDictate-portable.zip
+            dist/WinDictate.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# App data produced at runtime (installed / portable modes)
+data/
+runtime/
+logs/
+settings.json
+history.json
+*.log
+
+# Build outputs (binaries are attached to GitHub Releases, not committed)
+build/
+dist/
+_portable/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/

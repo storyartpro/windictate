@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Create Python environment
+        shell: pwsh
+        run: |
+          uv venv --python 3.11 .venv
+          uv pip install --python .venv\Scripts\python.exe faster-whisper==1.2.1 sounddevice numpy pystray pillow
+
+      - name: Byte-compile sources
+        shell: pwsh
+        run: .venv\Scripts\python.exe -m compileall -q app.py dictate server scripts
+
+      - name: Core tests (headless)
+        shell: pwsh
+        run: .venv\Scripts\python.exe tests\test_core.py
+
+      - name: UI tests
+        shell: pwsh
+        run: .venv\Scripts\python.exe tests\test_shell.py
+
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build launcher
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-launcher.ps1
+
+      - name: Build portable zip
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-portable.ps1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinDictate-portable
+          path: |
+            dist/WinDictate-portable.zip
+            dist/WinDictate.exe
+          if-no-files-found: error
